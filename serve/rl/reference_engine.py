@@ -20,6 +20,7 @@ from typing import Sequence
 import torch
 
 from serve.rl.base import (
+    FINISH_LENGTH,
     GenerationResult,
     LoadReport,
     NamedTensors,
@@ -82,7 +83,14 @@ class ReferenceEngine(RolloutEngine):
                 model = AutoModelForCausalLM.from_pretrained(self.model_path, torch_dtype=self.dtype)
             except TypeError:  # newer transformers renamed the argument
                 model = AutoModelForCausalLM.from_pretrained(self.model_path, dtype=self.dtype)
-        self.model = model.to(device=self.device, dtype=self.dtype).eval()
+        # Move, then cast PARAMETERS only: Module.to(dtype=...) would also
+        # round float buffers such as Qwen3's rotary inv_freq, which
+        # from_pretrained (and therefore vLLM and the verl actor) keep in fp32.
+        model = model.to(self.device)
+        for param in model.parameters():
+            if param.dtype != self.dtype:
+                param.data = param.data.to(self.dtype)
+        self.model = model.eval()
         self.model.requires_grad_(False)
         self.config = self.model.config
 
@@ -93,6 +101,9 @@ class ReferenceEngine(RolloutEngine):
 
         self._default_eos = normalize_eos_ids(eos_token_ids) or self._eos_from_model()
         self._sleeping = False
+        # running process-wide peaks (generate() resets torch's counters)
+        self._process_peak_alloc = 0
+        self._process_peak_reserved = 0
 
     # ------------------------------------------------------------------
     def _eos_from_model(self) -> tuple[int, ...]:
@@ -115,8 +126,10 @@ class ReferenceEngine(RolloutEngine):
             return self.max_batch_size
         total = torch.cuda.get_device_properties(self.device).total_memory
         weights = unique_parameter_bytes(self.model.parameters())
-        # 2 GiB for logits / softmax scratch; x2 on the KV estimate because HF
-        # re-allocates the cache when it grows
+        # 2 GiB for logits / softmax scratch. x2 on the KV estimate: HF's
+        # DynamicCache re-allocates every K/V tensor each step, and the
+        # allocator can strand one outgrown generation of cache segments
+        # between the trims in _generate_batch (live memory is only ~1.07x).
         kv_budget = total * self.mem_fraction - weights - 2 * 1024**3
         per_request = (longest_prompt + max_new_tokens) * self._kv_token_bytes() * 2
         fit = int(kv_budget // per_request) if kv_budget > 0 else 0
@@ -199,9 +212,16 @@ class ReferenceEngine(RolloutEngine):
                 position_ids=step_positions,
                 past_key_values=past,
                 use_cache=True,
+                logits_to_keep=1,  # only the last position is sampled
             )
             forwards += 1
             past = out.past_key_values
+            if device.type == "cuda" and forwards % 16 == 0:
+                # Once the per-step re-allocated K/V tensors outgrow their
+                # allocator segments, the old segments stay cached and can
+                # never be reused; hand them back when they pile up.
+                if torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device) > 2 * 1024**3:
+                    torch.cuda.empty_cache()
             logits = out.logits[:, -1, :].to(torch.float32)
             if temperature == 0.0:
                 next_token = logits.argmax(dim=-1)
@@ -253,6 +273,9 @@ class ReferenceEngine(RolloutEngine):
 
         start = time.perf_counter()
         if self.device.type == "cuda":
+            # same bookkeeping as SparseSpecEngine.generate (see STAT_KEYS)
+            self._process_peak_alloc = max(self._process_peak_alloc, torch.cuda.max_memory_allocated(self.device))
+            self._process_peak_reserved = max(self._process_peak_reserved, torch.cuda.max_memory_reserved(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
             allocated_start = torch.cuda.memory_allocated(self.device)
 
@@ -275,6 +298,11 @@ class ReferenceEngine(RolloutEngine):
             rows += n_fwd * len(chunk)
             for i, row_toks, row_lps in zip(chunk, toks, lps):
                 token_ids[i], logprobs[i], reasons[i] = finalize_response(row_toks, row_lps, max_new_tokens, eos_set)
+                if reasons[i] == FINISH_LENGTH and len(token_ids[i]) != max_new_tokens:
+                    raise RuntimeError(
+                        f"prompt {i} stopped after {len(token_ids[i])} tokens without an EOS "
+                        f"(max_new_tokens={max_new_tokens})"
+                    )
             del toks, lps
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -290,7 +318,17 @@ class ReferenceEngine(RolloutEngine):
         if self.device.type == "cuda":
             weights = unique_parameter_bytes(self.model.parameters())
             peak = torch.cuda.max_memory_allocated(self.device)
+            peak_reserved = torch.cuda.max_memory_reserved(self.device)
+            self._process_peak_alloc = max(self._process_peak_alloc, peak)
+            self._process_peak_reserved = max(self._process_peak_reserved, peak_reserved)
             stats["peak_mem_gb"] = (peak - (allocated_start - weights)) / 1024**3
+            stats["process_peak_alloc_gb"] = self._process_peak_alloc / 1024**3
+            stats["process_peak_reserved_gb"] = self._process_peak_reserved / 1024**3
+            logger.info(
+                "ReferenceEngine.generate: peak allocated %.2f GiB, peak reserved %.2f GiB (whole process)",
+                peak / 1024**3,
+                peak_reserved / 1024**3,
+            )
         return GenerationResult(token_ids=token_ids, logprobs=logprobs, finish_reasons=reasons, stats=stats)
 
     # ------------------------------------------------------------------

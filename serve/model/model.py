@@ -73,6 +73,9 @@ class KVPool:
             math.ceil(self.capacity * 1.5) if cpu_capacity is None else int(cpu_capacity)
         )
         self._free_cpu = array.array("i", range(self._MAX_CPU_CAPACITY))
+        # 1 = page is in `_free_cpu`. Makes the double-free check below O(1);
+        # `idx not in self._free_cpu` scans the whole free list per page.
+        self._cpu_page_free = bytearray(b"\x01") * self._MAX_CPU_CAPACITY
         self._physical_mem_cpu = torch.empty(
             (
                 self._MAX_CPU_CAPACITY,
@@ -165,11 +168,13 @@ class KVPool:
     def alloc_page_cpu(self):
         assert len(self._free_cpu) > 0, "Out of memory"
         idx = self._free_cpu.pop()
+        self._cpu_page_free[idx] = 0
         return idx
 
     def free_page_cpu(self, idx: int):
-        assert idx not in self._free_cpu, f"Page {idx} already restored"
         assert 0 <= idx < self._physical_mem_cpu.shape[0]
+        assert not self._cpu_page_free[idx], f"Page {idx} already restored"
+        self._cpu_page_free[idx] = 1
         self._free_cpu.append(idx)
 
     def offload(self, idx_gpu, idx_cpu):

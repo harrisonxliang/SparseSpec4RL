@@ -7,8 +7,9 @@
 # Usage (A100 box, in the env with the patched verl — see RUNBOOK.md):
 #   bash baseline/run_seed_sparsespec.sh                         # the real run: seed 0, 100 steps
 #   STEPS=3 EXP_NAME=sparsespec_smoke bash baseline/run_seed_sparsespec.sh
-#   SPARSESPEC_ENGINE=reference STEPS=3 EXP_NAME=reference_smoke bash baseline/run_seed_sparsespec.sh
+#   SPARSESPEC_CUDA_GRAPH=False STEPS=3 EXP_NAME=sparsespec_eager_smoke bash baseline/run_seed_sparsespec.sh
 #   DRY_RUN=1 bash baseline/run_seed_sparsespec.sh               # print the hydra overrides and exit
+#   bash integration/smoke_reference.sh                          # reference-engine plumbing smoke (reduced size)
 #
 # Everything else (data, reward, GRPO hyperparams, checkpoint cadence,
 # logging) is inherited and must not be overridden here.
@@ -26,8 +27,16 @@ STEPS=${STEPS:-100}
 EXP_NAME=${EXP_NAME:-sparsespec_seed${SEED}}
 
 # sparsespec = the real engine (serve/, needs Harrison's build);
-# reference  = HF transformers behind the same interface (plumbing tests only).
+# reference  = HF transformers behind the same interface (plumbing tests only;
+#              never at this script's full size: 512 rollouts x up to 8192
+#              tokens decoded 7-8 at a time is hours per step. Use
+#              integration/smoke_reference.sh).
 SPARSESPEC_ENGINE=${SPARSESPEC_ENGINE:-sparsespec}
+
+# CUDA graphs for the SparseSpec engine. The baseline's vLLM runs eager (verl
+# default rollout.enforce_eager=True), so False gives an eager-vs-eager
+# timing; True is the engine's intended mode. See STATUS.md (fairness).
+SPARSESPEC_CUDA_GRAPH=${SPARSESPEC_CUDA_GRAPH:-True}
 
 SPARSESPEC_ARGS=(
     # ---- rollout engine block: the only sanctioned diff vs baseline ----
@@ -46,7 +55,7 @@ SPARSESPEC_ARGS=(
     +actor_rollout_ref.rollout.sparsespec.num_min_budget=128
     +actor_rollout_ref.rollout.sparsespec.kv_cache=pillar
     +actor_rollout_ref.rollout.sparsespec.max_batch_size=64
-    +actor_rollout_ref.rollout.sparsespec.cuda_graph=True
+    +actor_rollout_ref.rollout.sparsespec.cuda_graph="$SPARSESPEC_CUDA_GRAPH"
     # Diagnostics only: also return the engine's target log-probs so verl logs
     # training/rollout_probs_diff_* (engine vs actor) every step. The actor
     # still recomputes old_log_probs itself; the loss does not use these.
@@ -72,6 +81,12 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
     exit 0
 fi
 
+if [ "$SPARSESPEC_ENGINE" = "reference" ] && [ "${ALLOW_FULL_SIZE_REFERENCE:-0}" != "1" ]; then
+    echo "ERROR: SPARSESPEC_ENGINE=reference at the full-size config takes hours per step." >&2
+    echo "       Use: bash integration/smoke_reference.sh   (ALLOW_FULL_SIZE_REFERENCE=1 overrides)" >&2
+    exit 1
+fi
+
 # The patched verl imports serve.rl.verl_rollout inside the Ray workers,
 # which inherit this environment.
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -83,8 +98,15 @@ if ! python3 -c "import serve.rl.verl_rollout" 2>/dev/null; then
 fi
 if ! python3 - <<'EOF'
 import inspect, sys
+from verl.trainer.ppo import ray_trainer
 from verl.workers import fsdp_workers
-sys.exit(0 if '"sparsespec"' in inspect.getsource(fsdp_workers.ActorRolloutRefWorker._build_rollout) else 1)
+worker_ok = '"sparsespec"' in inspect.getsource(fsdp_workers.ActorRolloutRefWorker._build_rollout)
+trainer_ok = 'startswith("sparsespec/")' in inspect.getsource(ray_trainer)
+if not worker_ok:
+    print("verl patch: fsdp_workers.py hunk missing", file=sys.stderr)
+if not trainer_ok:
+    print("verl patch: ray_trainer.py hunk missing (engine stats would be logged as timing_s/sparsespec/*)", file=sys.stderr)
+sys.exit(0 if worker_ok and trainer_ok else 1)
 EOF
 then
     echo "ERROR: this env's verl does not have integration/verl-0.5.0-sparsespec.patch applied." >&2
@@ -98,7 +120,7 @@ mkdir -p "$LOG_DIR" "$RESULTS_DIR" "$CKPT_ROOT/$EXP_NAME"
 LOG_FILE="$LOG_DIR/$EXP_NAME.log"
 
 START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-echo "[run_sparsespec] $EXP_NAME: seed=$SEED steps=$STEPS config=$CONFIG_VERSION engine=$SPARSESPEC_ENGINE"
+echo "[run_sparsespec] $EXP_NAME: seed=$SEED steps=$STEPS config=$CONFIG_VERSION engine=$SPARSESPEC_ENGINE cuda_graph=$SPARSESPEC_CUDA_GRAPH"
 echo "[run_sparsespec] logging to $LOG_FILE"
 
 set +e

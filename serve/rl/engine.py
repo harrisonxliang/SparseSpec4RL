@@ -42,6 +42,7 @@ from serve.model.model import KVPool, Transformer
 from serve.request.kv_cache_ptr.pillar import PillarCachePtr
 from serve.request.request import Request
 from serve.rl.base import (
+    FINISH_LENGTH,
     GenerationResult,
     LoadReport,
     NamedTensors,
@@ -52,7 +53,16 @@ from serve.rl.base import (
     validate_prompts,
     validate_sampling_params,
 )
-from serve.rl.memory import GIB, EngineLimits, MemoryPlan, check_workload_fits, plan_memory
+from serve.rl.memory import (
+    GIB,
+    EngineLimits,
+    MemoryPlan,
+    admission_capacity_tokens,
+    check_prob_offsets,
+    check_workload_fits,
+    plan_memory,
+    request_token_need,
+)
 from serve.rl.scheduler import RLSpecScheduler
 from serve.rl.weights import load_weights_inplace, parameter_pointers, unique_parameter_bytes, verify_weights
 from serve.sampling.rejection_sampler import RejectionSampler
@@ -186,8 +196,15 @@ class SparseSpecEngine(RolloutEngine):
         self._runner = None
         self._wake_stats = {"wake_s": 0.0, "graph_capture_s": 0.0}
         self._measured: dict[str, float] = {}
+        # reserved-but-not-allocated memory held by the CUDA graphs' private pools
+        self._graph_pool_bytes = 0
+        # running process-wide peaks, kept because generate() resets torch's counters
+        self._process_peak_alloc = 0
+        self._process_peak_reserved = 0
+        self._warned_inflight_cap: set = set()
 
         init_start = time.perf_counter()
+        gc.collect()
         allocated_before = torch.cuda.memory_allocated(self.device)
 
         # engine-private RNG stream, seeded exactly once
@@ -225,6 +242,7 @@ class SparseSpecEngine(RolloutEngine):
                     "spec_stride too large for the verification score kernel "
                     "((spec_stride + 1) * num_qo_heads / num_kv_heads must stay below 64)"
                 )
+            check_prob_offsets(self.max_batch_size, self.spec_stride, self.chunk_size, self.config.vocab_size)
 
             self.limits = EngineLimits(
                 max_total_draft_kv_len=PillarCachePtr.MAX_TOTAL_DRAFT_KV_LEN,
@@ -291,14 +309,17 @@ class SparseSpecEngine(RolloutEngine):
             self._build_runner()
 
         torch.cuda.synchronize(self.device)
+        # allocated-based (the trainer's share is derived from it in generate());
+        # the graphs' private-pool slack is tracked separately and added to
+        # everything that is reported
         self._resident_bytes = torch.cuda.memory_allocated(self.device) - allocated_before
         self._measured["init_s"] = time.perf_counter() - init_start
-        self._measured["resident_awake_gb"] = self._resident_bytes / GIB
+        self._measured["resident_awake_gb"] = (self._resident_bytes + self._graph_pool_bytes) / GIB
         logger.info(
             "SparseSpecEngine ready in %.1fs: %.2f GiB resident while awake (planned without transient scratch: "
             "%.2f GiB, share: %.2f GiB)",
             self._measured["init_s"],
-            self._resident_bytes / GIB,
+            self._measured["resident_awake_gb"],
             (self.plan.planned_bytes - self.plan.transient_bytes - self.plan.safety_bytes - self.plan.request_bytes)
             / GIB,
             self.plan.budget_bytes / GIB,
@@ -313,12 +334,26 @@ class SparseSpecEngine(RolloutEngine):
         run_inference's torch defaults, and the engine's own RNG stream."""
         outer_rng = torch.cuda.get_rng_state(self.device)
         torch.cuda.set_rng_state(self._rng_state, self.device)
+        # ctx_torch_default "restores" the default device with
+        # set_default_device(cpu), which installs a DeviceContext('cpu')
+        # torch-function mode instead of returning to "no context". Left in
+        # place it would change torch.tensor(<cuda tensor>) in the trainer
+        # thread, so remove it unless the caller had a context of its own.
+        tls = getattr(torch, "_GLOBAL_DEVICE_CONTEXT", None)
+        had_device_ctx = getattr(tls, "device_context", None) is not None
         try:
             with torch.inference_mode(), ctx_torch_default(device=str(self.device), dtype=self.dtype):
                 yield
         finally:
-            self._rng_state = torch.cuda.get_rng_state(self.device)
-            torch.cuda.set_rng_state(outer_rng, self.device)
+            try:
+                if not had_device_ctx:
+                    torch.set_default_device(None)  # pops the leftover DeviceContext mode
+                    if tls is not None and getattr(tls, "device_context", 0) is None:
+                        # torch <= 2.7: get_default_device() dereferences this None
+                        del tls.device_context
+            finally:
+                self._rng_state = torch.cuda.get_rng_state(self.device)
+                torch.cuda.set_rng_state(outer_rng, self.device)
 
     def _eos_from_checkpoint(self, hf_config) -> tuple[int, ...]:
         eos: list = []
@@ -363,14 +398,37 @@ class SparseSpecEngine(RolloutEngine):
         start = time.perf_counter()
         self.kv_pool.phase_idx = 0
         runner = CUDAGraphModelWrapper(self.model)
+        self._graph_pool_bytes = 0
         if self.cuda_graph:
-            # identical call to run_inference
-            runner.eager_cuda_graph_mode(
-                max_batch_size=int(self.max_batch_size * 2.5),
-                num_cuda_graphs=14,
-                max_padded_ratio=1,
-            )
             torch.cuda.synchronize(self.device)
+            # torch 2.7 / 2.8: torch.cuda.graph.__enter__ runs an unconditional
+            # full gc.collect() for each of the 24 captures. Collect once (this
+            # also drops trainer garbage that may hold CUDA memory), then park
+            # the surviving heap in the permanent generation so those passes
+            # only scan objects created during capture.
+            gc.collect()
+            torch.cuda.empty_cache()
+            reserved_before = torch.cuda.memory_reserved(self.device)
+            allocated_before = torch.cuda.memory_allocated(self.device)
+            gc.freeze()
+            try:
+                # identical call to run_inference
+                runner.eager_cuda_graph_mode(
+                    max_batch_size=int(self.max_batch_size * 2.5),
+                    num_cuda_graphs=14,
+                    max_padded_ratio=1,
+                )
+            finally:
+                gc.unfreeze()
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+            # Tensors freed during capture stay reserved in each graph's
+            # private pool but no longer count as allocated.
+            reserved = torch.cuda.memory_reserved(self.device) - reserved_before
+            allocated = torch.cuda.memory_allocated(self.device) - allocated_before
+            self._graph_pool_bytes = max(0, reserved - allocated)
+            self._measured["graph_reserved_gb"] = reserved / GIB
+            self._measured["graph_pool_unallocated_gb"] = self._graph_pool_bytes / GIB
         self._runner = runner
         self._wake_stats["graph_capture_s"] = time.perf_counter() - start if self.cuda_graph else 0.0
 
@@ -396,6 +454,7 @@ class SparseSpecEngine(RolloutEngine):
         self._require_open()
         if self._sleeping:
             return
+        gc.collect()
         before = torch.cuda.memory_allocated(self.device)
         self._runner = None  # drops the graphs, their private pools and output buffers
         gc.collect()
@@ -407,11 +466,13 @@ class SparseSpecEngine(RolloutEngine):
         freed = before - torch.cuda.memory_allocated(self.device)
         self._resident_bytes -= freed
         self._sleeping = True
-        self._measured["sleep_freed_gb"] = freed / GIB
+        # the graphs' private pools go away with the graphs
+        self._measured["sleep_freed_gb"] = (freed + self._graph_pool_bytes) / GIB
+        self._graph_pool_bytes = 0
         self._measured["resident_asleep_gb"] = self._resident_bytes / GIB
         logger.info(
             "SparseSpecEngine asleep: freed %.2f GiB, %.2f GiB still resident (weights + fixed buffers)",
-            freed / GIB,
+            self._measured["sleep_freed_gb"],
             self._resident_bytes / GIB,
         )
 
@@ -426,6 +487,7 @@ class SparseSpecEngine(RolloutEngine):
         if not self._sleeping:
             return
         start = time.perf_counter()
+        gc.collect()
         before = torch.cuda.memory_allocated(self.device)
         with self._ctx():
             self.kv_pool._physical_mem_gpu = torch.empty(self._kv_shape, dtype=self.dtype, device=self.device)
@@ -440,7 +502,7 @@ class SparseSpecEngine(RolloutEngine):
         torch.cuda.synchronize(self.device)
         self._resident_bytes += torch.cuda.memory_allocated(self.device) - before
         self._wake_stats["wake_s"] = time.perf_counter() - start
-        self._measured["resident_awake_gb"] = self._resident_bytes / GIB
+        self._measured["resident_awake_gb"] = (self._resident_bytes + self._graph_pool_bytes) / GIB
 
     def _check_pool_clean(self, where: str) -> None:
         """Every KV page must be back in the free lists between generate calls."""
@@ -459,6 +521,7 @@ class SparseSpecEngine(RolloutEngine):
         )
         pool._free_gpu = set(range(pool.capacity))
         pool._free_cpu = array.array("i", range(pool._MAX_CPU_CAPACITY))
+        pool._cpu_page_free = bytearray(b"\x01") * pool._MAX_CPU_CAPACITY
 
     # ------------------------------------------------------------------
     # weights
@@ -542,6 +605,8 @@ class SparseSpecEngine(RolloutEngine):
             max_position_embeddings=getattr(self.config, "max_position_embeddings", None),
             limits=self.limits,
         )
+        admit_cap = admission_capacity_tokens(self.plan, self.max_batch_size, self.spec_stride, self.chunk_size)
+        self._warn_inflight_cap(admit_cap, max(prompt_lens), max_new_tokens, len(prompts))
         longest_ctx = max(prompt_lens) + max_new_tokens + self.spec_stride + 2
         if max(self.num_min_budget, math.ceil(longest_ctx * self.budget_ratio)) >= self.limits.max_len_selected_kv_cache:
             raise ValueError(
@@ -554,6 +619,13 @@ class SparseSpecEngine(RolloutEngine):
         scheduler = None
         try:
             with self._ctx():
+                # reset_peak_memory_stats is device-global and verl's
+                # perf/max_memory_* read the same counters: remember what the
+                # reset destroys (published as process_peak_*_gb)
+                self._process_peak_alloc = max(self._process_peak_alloc, torch.cuda.max_memory_allocated(self.device))
+                self._process_peak_reserved = max(
+                    self._process_peak_reserved, torch.cuda.max_memory_reserved(self.device)
+                )
                 torch.cuda.reset_peak_memory_stats(self.device)
                 allocated_start = torch.cuda.memory_allocated(self.device)
                 # A request completes at the first verify pass after it holds
@@ -563,12 +635,16 @@ class SparseSpecEngine(RolloutEngine):
                 scheduler = RLSpecScheduler(
                     self.kv_pool,
                     self._runner,
-                    total_token_capacity=self.plan.total_capacity_tokens,
+                    total_token_capacity=admit_cap,
                     **self._job_args(temperature, eos, len(prompts)),
                 )
                 finished = scheduler.run(list(requests))
                 torch.cuda.synchronize(self.device)
                 peak = torch.cuda.max_memory_allocated(self.device)
+                self._process_peak_alloc = max(self._process_peak_alloc, peak)
+                self._process_peak_reserved = max(
+                    self._process_peak_reserved, torch.cuda.max_memory_reserved(self.device)
+                )
             if len(finished) != len(requests):
                 raise RuntimeError(f"scheduler returned {len(finished)} of {len(requests)} requests")
 
@@ -578,6 +654,11 @@ class SparseSpecEngine(RolloutEngine):
                 toks, lps, reason = finalize_response(response, request.rl_logprobs, max_new_tokens, eos_set)
                 if not toks:
                     raise RuntimeError(f"request {request.request_id} produced an empty response")
+                if reason == FINISH_LENGTH and len(toks) != max_new_tokens:
+                    raise RuntimeError(
+                        f"request {request.request_id} stopped after {len(toks)} tokens without an EOS "
+                        f"(max_new_tokens={max_new_tokens})"
+                    )
                 token_ids.append(toks)
                 logprobs.append(lps)
                 reasons.append(reason)
@@ -597,8 +678,11 @@ class SparseSpecEngine(RolloutEngine):
                 num_offloads=float(rl.num_offloads),
                 kv_util_peak=rl.peak_kv_used / self.kv_pool.capacity,
                 # peak of everything allocated during generate, minus what the
-                # rest of the process (the trainer) already held at the start
-                peak_mem_gb=(peak - (allocated_start - self._resident_bytes)) / GIB,
+                # rest of the process (the trainer) already held at the start,
+                # plus what the CUDA graphs' private pools reserve unallocated
+                peak_mem_gb=(peak - (allocated_start - self._resident_bytes) + self._graph_pool_bytes) / GIB,
+                process_peak_alloc_gb=self._process_peak_alloc / GIB,
+                process_peak_reserved_gb=self._process_peak_reserved / GIB,
                 gen_s=time.perf_counter() - start,
             )
             if stats["peak_mem_gb"] * GIB > self.plan.budget_bytes:
@@ -624,6 +708,36 @@ class SparseSpecEngine(RolloutEngine):
     # ------------------------------------------------------------------
     # misc
     # ------------------------------------------------------------------
+    def inflight_cap(self, longest_prompt: int, max_new_tokens: int) -> int:
+        """Most requests the admission guard lets run at once for this workload."""
+        admit_cap = admission_capacity_tokens(self.plan, self.max_batch_size, self.spec_stride, self.chunk_size)
+        need = request_token_need(longest_prompt, max_new_tokens, self.spec_stride)
+        return min(self.max_batch_size, admit_cap // need)
+
+    def _warn_inflight_cap(self, admit_cap: int, longest_prompt: int, max_new_tokens: int, num_prompts: int) -> None:
+        need = request_token_need(longest_prompt, max_new_tokens, self.spec_stride)
+        cap = admit_cap // need
+        key = (max_new_tokens, cap)
+        if cap >= min(self.max_batch_size, num_prompts) or key in self._warned_inflight_cap:
+            return
+        self._warned_inflight_cap.add(key)
+        plan = self.plan
+        reserve = plan.total_capacity_tokens - admit_cap
+        ratio = (self.max_batch_size * need + reserve - plan.kv_capacity_tokens) / plan.kv_capacity_tokens
+        logger.warning(
+            "worst-case KV admission limits concurrency to %d in-flight requests although max_batch_size is %d: "
+            "each request may need %d KV tokens and the pools hold %d (GPU) + %d (host). Realised concurrency is "
+            "logged as sparsespec/batch_size_mean. sparsespec.cpu_offload_ratio >= %.1f (about %.0f GiB of pinned "
+            "host RAM, locked in power-of-two blocks) would lift the cap to max_batch_size.",
+            cap,
+            self.max_batch_size,
+            need,
+            plan.kv_capacity_tokens,
+            plan.cpu_capacity_tokens,
+            ratio,
+            ratio * plan.kv_capacity_tokens * plan.kv_token_bytes / GIB,
+        )
+
     def memory_report(self) -> dict:
         """Planned vs measured memory, for logs and STATUS.md."""
         plan = self.plan

@@ -56,8 +56,9 @@ class MemoryPlan:
     kv_bytes: int
     kv_capacity_tokens: int
     cpu_capacity_tokens: int
-    cpu_pinned_bytes: int
+    cpu_pinned_bytes: int  # what torch really page-locks (a power of two)
     capacity_overridden: bool = False
+    cpu_requested_tokens: int = 0  # kv_capacity_tokens * cpu_offload_ratio, before block sizing
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -91,7 +92,12 @@ class MemoryPlan:
             f"  KV pool         {gib(self.kv_bytes)}  = {self.kv_capacity_tokens} tokens "
             f"({self.kv_token_bytes / 1024:.1f} KiB/token)"
             + ("  [kv_capacity_tokens override]" if self.capacity_overridden else ""),
-            f"host offload pool {gib(self.cpu_pinned_bytes)}  = {self.cpu_capacity_tokens} tokens (pinned)",
+            f"host offload pool {gib(self.cpu_pinned_bytes)}  = {self.cpu_capacity_tokens} tokens (pinned)"
+            + (
+                f"  [asked for {self.cpu_requested_tokens}; sized to fill a power-of-two pinned block]"
+                if self.cpu_requested_tokens != self.cpu_capacity_tokens
+                else ""
+            ),
         ]
         lines.extend(f"  note: {n}" for n in self.notes)
         return "\n".join(lines)
@@ -138,9 +144,15 @@ def graph_bytes(vocab_size: int, hidden_size: int, dtype_bytes: int, kv_capacity
     Dominated by each graph's logits output [batch, vocab]. Activations inside
     a graph are [batch, O(hidden)] tensors whose blocks the graph's private
     pool reuses from layer to layer; they are covered by an allowance of 32
-    hidden-sized rows per token plus 20% headroom. Deliberately on the high
-    side: compare with the measured "resident while awake" number the engine
-    logs and set sparsespec.kv_capacity_tokens if the gap is worth reclaiming.
+    hidden-sized rows per token plus 20% headroom.
+
+    The estimate is for what the graphs' private pools keep RESERVED, not for
+    what stays allocated: after capture only the logits outputs remain
+    allocated, while each pool also holds the allocator segments its
+    activations used. Compare it with the engine's measured
+    ``graph_reserved_gb`` (a ``torch.cuda.memory_reserved`` delta around
+    capture), never with allocated memory, before raising
+    ``sparsespec.kv_capacity_tokens``.
     """
     sizes = [
         b
@@ -150,6 +162,32 @@ def graph_bytes(vocab_size: int, hidden_size: int, dtype_bytes: int, kv_capacity
     tokens = sum(sizes)
     per_token = vocab_size * dtype_bytes + 32 * hidden_size * dtype_bytes
     return int(2 * tokens * per_token * 1.2)
+
+
+def pinned_block_bytes(nbytes: int) -> int:
+    """Bytes torch's pinned (page-locked) host allocator takes for a request.
+
+    ``c10::CachingHostAllocator`` rounds every request up to the next power of
+    two (torch 2.7 / 2.8), so a 16.1 GiB pool would lock 32 GiB of host RAM.
+    """
+    return 0 if nbytes <= 0 else 1 << (nbytes - 1).bit_length()
+
+
+def host_pool_tokens(requested_tokens: int, token_bytes: int) -> int:
+    """Size the host offload pool to the block that will actually be locked.
+
+    Keep the request when it (nearly) fills its power-of-two block; otherwise
+    shrink it to fill the block below exactly, so the pool never locks much
+    more host RAM than it can use.
+    """
+    if requested_tokens <= 0:
+        return 0
+    requested = requested_tokens * token_bytes
+    block = pinned_block_bytes(requested)
+    if block - requested <= block // 16:
+        return requested_tokens
+    # a pool smaller than one token's block cannot be shrunk; keep the request
+    return (block // 2) // token_bytes or requested_tokens
 
 
 def plan_memory(
@@ -219,7 +257,8 @@ def plan_memory(
             f"safety {safety_bytes / GIB:.2f}). Raise gpu_memory_utilization or lower max_batch_size."
         )
 
-    cpu_capacity = int(capacity * cpu_offload_ratio)
+    cpu_requested = int(capacity * cpu_offload_ratio)
+    cpu_capacity = host_pool_tokens(cpu_requested, token_bytes)
     return MemoryPlan(
         total_bytes=int(total_bytes),
         budget_bytes=budget,
@@ -234,10 +273,51 @@ def plan_memory(
         kv_bytes=capacity * token_bytes,
         kv_capacity_tokens=capacity,
         cpu_capacity_tokens=cpu_capacity,
-        cpu_pinned_bytes=cpu_capacity * token_bytes,
+        cpu_pinned_bytes=pinned_block_bytes(cpu_capacity * token_bytes),
         capacity_overridden=overridden,
+        cpu_requested_tokens=cpu_requested,
         notes=notes,
     )
+
+
+# Request.MAX_OFFLOADING_LEN: KV tokens moved per offload / restore step
+OFFLOAD_CHUNK_TOKENS = 1024
+
+
+def admission_capacity_tokens(plan: "MemoryPlan", max_batch_size: int, spec_stride: int, chunk_size: int) -> int:
+    """Worst-case KV tokens the scheduler may commit to in-flight requests.
+
+    GPU pool + host offload pool, minus a reserve for what the pools can be
+    short of at the instant an offload is triggered: upstream offloads in
+    1024-token steps once ``free - owed < 0``, where ``owed`` is at most one
+    prefill chunk plus ``spec_stride + 1`` tokens per active request. With
+    the sum of worst-case request sizes kept below this number, neither
+    ``alloc_page`` nor ``alloc_page_cpu`` can run out.
+    """
+    reserve = max_batch_size * (spec_stride + 2) + chunk_size + 2 * OFFLOAD_CHUNK_TOKENS
+    return plan.kv_capacity_tokens + plan.cpu_capacity_tokens - reserve
+
+
+def max_rows_per_pass(max_batch_size: int, spec_stride: int, chunk_size: int) -> int:
+    """Most token rows one forward pass can hold: every in-flight request
+    verifying (spec_stride + 1 rows each) plus one prefill chunk."""
+    return max_batch_size * (spec_stride + 1) + chunk_size
+
+
+def check_prob_offsets(max_batch_size: int, spec_stride: int, chunk_size: int, vocab_size: int) -> None:
+    """serve/request/kv_cache_ptr/base.py computes byte offsets into the
+    [rows, vocab] float32 probability tensors as int32
+    (``start_pos * 4 * vocab``) before adding them to a 64-bit address. They
+    wrap, i.e. corrupt memory, once a row index reaches 2**31 / (4 * vocab)
+    (3534 for Qwen3's vocabulary). Refuse configurations that could get there."""
+    rows = max_rows_per_pass(max_batch_size, spec_stride, chunk_size)
+    limit = (2**31 - 1) // (4 * vocab_size)
+    if rows > limit:
+        raise ValueError(
+            f"max_batch_size={max_batch_size} with spec_stride={spec_stride} and chunk_size={chunk_size} allows "
+            f"{rows} token rows per forward pass, beyond the {limit} rows the engine's int32 probability-buffer "
+            f"offsets can address for a vocabulary of {vocab_size}. Lower sparsespec.max_batch_size."
+        )
 
 
 def request_token_need(prompt_len: int, max_new_tokens: int, spec_stride: int) -> int:
@@ -273,7 +353,8 @@ def check_workload_fits(
     # A lone request must be admissible, otherwise the scheduler loop never starts.
     prefill_iters = -(-longest // chunk_size) + 1
     headroom = longest + (spec_stride + 2) * prefill_iters
-    if need > plan.total_capacity_tokens or headroom >= plan.kv_capacity_tokens or need > plan.kv_capacity_tokens:
+    admit_cap = admission_capacity_tokens(plan, max_batch_size, spec_stride, chunk_size)
+    if need > admit_cap or headroom >= plan.kv_capacity_tokens or need > plan.kv_capacity_tokens:
         raise MemoryError(
             f"a single request may need {need} KV tokens but the GPU pool holds {plan.kv_capacity_tokens} "
             f"(+{plan.cpu_capacity_tokens} on host). Raise gpu_memory_utilization or lower the response length."

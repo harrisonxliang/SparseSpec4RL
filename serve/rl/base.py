@@ -44,6 +44,13 @@ STAT_KEYS = (
     "num_offloads",  # KV offload events (GPU -> host)
     "kv_util_peak",  # peak fraction of the GPU KV pool in use
     "peak_mem_gb",  # peak GPU memory attributed to the engine during generate
+    # Running process-wide peaks of torch's allocator up to the end of this
+    # generate(). generate() resets torch's peak counters to measure
+    # peak_mem_gb, so in this arm verl's perf/max_memory_* become per-step
+    # peaks (generate() start -> update_actor); the process peak at step N is
+    # max(process_peak_*_gb[N], perf/max_memory_*_gb[N]).
+    "process_peak_alloc_gb",
+    "process_peak_reserved_gb",
     "gen_s",  # wall time of generate()
 )
 

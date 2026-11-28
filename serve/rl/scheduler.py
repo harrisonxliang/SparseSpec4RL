@@ -7,19 +7,22 @@ What it adds on top of ``serve.scheduler.spec_scheduler.SpecScheduler``
 (synchronous mode only), without changing how tokens are drafted, verified
 or sampled:
 
-1. Target log-probs. Every token that ends up in a response was sampled
-   from, or accepted against, a row of the full-attention ("target")
-   probability tensor of the forward pass that confirmed it:
+1. Target log-probs. Every token that ends up in a response is distributed
+   according to one row of the full-attention ("target") probability tensor
+   of the forward pass that confirmed it:
 
    * the first response token comes from the NORMAL (full-attention) pass
      that finished prefill: row ``token_indptr[idx + 1] - 1``;
-   * a verify pass feeds ``k + 1`` tokens (the last confirmed token and the
-     ``k`` draft tokens) and its rows ``start + j`` are the target
-     distributions for output position ``j``. The rejection sampler returns
-     ``m`` accepted draft tokens followed by one recovered token (``m < k``,
-     row ``start + m``) or the bonus token (``m == k``, row ``start + k``,
-     sampled from that row by the regular sampler). So output token ``j``
-     always has target probability ``probs[start + j, token_j]``.
+   * a verify pass feeds ``n + 1`` tokens (the last confirmed token and the
+     ``n`` draft tokens; ``n == spec_stride`` except in a request's first
+     cycle, which has ``spec_stride - initial_idx`` drafts) and its rows
+     ``start + j`` are the target distributions for output position ``j``.
+     The rejection sampler returns ``m`` accepted draft tokens followed by
+     one recovered token (``m < n``, drawn from the normalized residual
+     ``max(0, p - q)`` of row ``start + m``; its marginal law is that row)
+     or the bonus token (``m == n``, sampled from row ``start + n`` by the
+     regular sampler). So output token ``j`` always has target probability
+     ``probs[start + j, token_j]``.
 
    Those probabilities are ``softmax(logits / temperature)`` in float32
    (``serve/sampling/fast_fused_op.py``), i.e. the same temperature scaling

@@ -193,7 +193,29 @@ def _assemble(target: _Target, state: dict[str, torch.Tensor]) -> torch.Tensor:
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
 
-def _expected_shape(target: _Target, state: dict[str, torch.Tensor]) -> tuple[int, ...]:
+def _expected_part_rows(model, target: _Target) -> tuple[int, ...] | None:
+    """Rows each fused source must contribute, read from the module that owns
+    the fused parameter (None when the layout cannot be determined)."""
+    if len(target.sources) == 1:
+        return None
+    owner = None
+    for name, module in model.named_modules():
+        for attr in ("wqkv", "w12"):
+            fused = getattr(module, attr, None)
+            if isinstance(fused, torch.nn.Module) and any(p is target.param for p in fused.parameters(recurse=False)):
+                owner, kind = module, attr
+    if owner is None:
+        return None
+    if kind == "w12":  # FeedForward.forward: silu_and_mul splits the output in two halves
+        return (target.param.shape[0] // 2,) * 2
+    heads = [getattr(owner, a, None) for a in ("num_qo_heads", "num_kv_heads", "head_dim")]
+    if any(h is None for h in heads):
+        return None
+    qo, kv, dim = heads  # Attention.forward: split([qo * dim, kv * dim, kv * dim])
+    return (qo * dim, kv * dim, kv * dim)
+
+
+def _expected_shape(target: _Target, state: dict[str, torch.Tensor], model=None) -> tuple[int, ...]:
     shapes = [tuple(state[k].shape) for k in target.sources]
     if len(shapes) == 1:
         return shapes[0]
@@ -201,6 +223,12 @@ def _expected_shape(target: _Target, state: dict[str, torch.Tensor]) -> tuple[in
     for key, shape in zip(target.sources, shapes):
         if shape[1:] != tail:
             raise ValueError(f"cannot fuse {target.sources}: {key!r} has shape {shape}, expected (*, {tail})")
+    rows = _expected_part_rows(model, target) if model is not None else None
+    if rows is not None and tuple(s[0] for s in shapes) != rows:
+        raise ValueError(
+            f"cannot fuse {target.sources} into {target.name}: the parts have {tuple(s[0] for s in shapes)} rows "
+            f"but the engine splits the fused tensor as {rows}"
+        )
     return (sum(s[0] for s in shapes),) + tail
 
 
@@ -216,7 +244,7 @@ def load_weights_inplace(model, named_tensors: NamedTensors) -> LoadReport:
 
     # Phase 1: validate everything before touching a single parameter.
     for target in targets:
-        expected = _expected_shape(target, state)
+        expected = _expected_shape(target, state, model)
         if tuple(target.param.shape) != expected:
             raise ValueError(
                 f"shape mismatch for {target.name}: engine {tuple(target.param.shape)} vs "

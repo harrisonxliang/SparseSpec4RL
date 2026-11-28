@@ -60,6 +60,8 @@ _PUBLISHED_STATS = (
     "num_offloads",
     "kv_util_peak",
     "peak_mem_gb",
+    "process_peak_alloc_gb",
+    "process_peak_reserved_gb",
     "gen_s",
 )
 
@@ -308,6 +310,13 @@ class SparseSpecShardingManager(BaseShardingManager):
     ``sparsespec/`` are logged under exactly that name (two-line trainer
     change in the verl patch); without that change they still appear, as
     ``timing_s/sparsespec/...``.
+
+    Memory metrics are NOT comparable across arms through verl's own
+    ``perf/max_memory_*`` columns: torch's counters keep counting vLLM's
+    sleeping (unmapped) pool in the baseline, and this engine resets the peak
+    counters at the start of every ``generate``. Use ``sparsespec/peak_mem_gb``
+    (engine peak during rollout), ``sparsespec/resident_asleep_gb`` (what the
+    engine holds during training) and ``sparsespec/process_peak_*_gb``.
     """
 
     def __init__(self, module, rollout: SparseSpecRollout, rollout_config, offload_param: bool = False):
@@ -394,6 +403,13 @@ class SparseSpecShardingManager(BaseShardingManager):
         for name in _PUBLISHED_STATS:
             self.timing[METRIC_PREFIX + name] = float(stats.get(name, 0.0))
         self.rollout.last_stats = {}
+
+        # GPU memory the engine keeps while the trainer runs (weights + fixed
+        # kernel buffers). vLLM's level-1 sleep keeps none, so this is part of
+        # the arms' memory difference. 0.0 if the engine does not measure it.
+        report = self.engine.memory_report() if hasattr(self.engine, "memory_report") else {}
+        measured = report.get("measured", {}) if isinstance(report, dict) else {}
+        self.timing[METRIC_PREFIX + "resident_asleep_gb"] = float(measured.get("resident_asleep_gb", 0.0))
 
 
 def build_sparsespec_rollout(
