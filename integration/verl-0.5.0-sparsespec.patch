@@ -1,0 +1,50 @@
+SparseSpec4RL: add the `sparsespec` rollout backend to verl 0.5.0.
+
+Two changes, nothing else:
+  1. verl/workers/fsdp_workers.py: one new branch in
+     ActorRolloutRefWorker._build_rollout that hands construction of the
+     rollout + sharding manager to serve.rl.verl_rollout (SparseSpec4RL repo,
+     must be on PYTHONPATH). The vllm / sglang / hf branches are untouched.
+  2. verl/trainer/ppo/ray_trainer.py: one statement that moves timing-dict
+     entries named `sparsespec/...` into the step metrics under that name
+     (a no-op for every other backend, which never produces such keys).
+
+Apply from the root of a verl v0.5.0 checkout:  git apply <this file>
+(or `patch -p1 < <this file>` inside site-packages for a non-editable install)
+
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -553,6 +553,22 @@
+                 multi_stage_wake_up=self.config.rollout.multi_stage_wake_up,
+             )
+             log_gpu_memory_usage("After building sharding manager", logger=logger)
++
++        elif rollout_name == "sparsespec":
++            # SparseSpec4RL: engine, rollout class and sharding manager live in <SparseSpec4RL>/serve/rl
++            from serve.rl.verl_rollout import build_sparsespec_rollout
++
++            log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
++            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
++            rollout, rollout_sharding_manager = build_sparsespec_rollout(
++                model_path=local_path,
++                rollout_config=self.config.rollout,
++                tokenizer=self.tokenizer,
++                model_hf_config=self.actor_model_config,
++                actor_module=self.actor_module_fsdp,
++                offload_param=self._is_offload_param,
++            )
++            log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
+ 
+         else:
+             raise NotImplementedError(f"Rollout name: {self.config.rollout.name} is not supported")
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1173,6 +1173,8 @@
+                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                         timing_raw.update(gen_batch_output.meta_info["timing"])
+                         gen_batch_output.meta_info.pop("timing", None)
++                        # SparseSpec4RL: engine stats ride along in the timing dict; log them as sparsespec/<name>
++                        metrics.update({k: timing_raw.pop(k) for k in list(timing_raw) if k.startswith("sparsespec/")})
+ 
+                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                         with marked_timer("gen_max", timing_raw, color="purple"):

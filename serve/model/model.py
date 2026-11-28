@@ -41,6 +41,7 @@ class KVPool:
         dtype: torch.dtype = torch.float16,
         page_size: int = 1,
         vanilla_backend: bool = False,
+        cpu_capacity: int | None = None,
     ):
         self._free_gpu = set(range(capacity))
         self.num_layers = config.num_layers
@@ -66,7 +67,11 @@ class KVPool:
         )
 
         # NOTE(Yilong): This could be super slow on certain machines.
-        self._MAX_CPU_CAPACITY = math.ceil(self.capacity * 1.5)
+        # `cpu_capacity` (tokens) sizes the pinned host offload pool; the
+        # default keeps the original 1.5x GPU capacity.
+        self._MAX_CPU_CAPACITY = (
+            math.ceil(self.capacity * 1.5) if cpu_capacity is None else int(cpu_capacity)
+        )
         self._free_cpu = array.array("i", range(self._MAX_CPU_CAPACITY))
         self._physical_mem_cpu = torch.empty(
             (
