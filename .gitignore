@@ -186,3 +186,6 @@ analysis/gemm_profile/output*
 *.json
 
 outputs/
+
+# editable verl checkout created by integration/setup_env.sh
+integration/.verl-0.5.0/
