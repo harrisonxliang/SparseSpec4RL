@@ -12,6 +12,10 @@ and the GPU unit tests are **not run**; their scripts, thresholds and exact comm
 So the weight-reload log-prob gate is **not passed yet**, and the real run cannot be launched until the
 gates have been run on the box in Harrison's `verl-sparsespec` env. The launch deadline is Nov 29.
 
+Two scripts have never been executed anywhere, not even on CPU: `integration/setup_env.sh` (no conda on
+the Mac) and `integration/smoke_reference.sh` (verl cannot start a worker without CUDA). A failure of
+either on the box may be a first-run script bug rather than an environment problem.
+
 ## Gate results
 
 | Gate | Status | Result |
@@ -23,7 +27,9 @@ gates have been run on the box in Harrison's `verl-sparsespec` env. The launch d
 | 3c reload gate, real step-25 checkpoint | **not run** (no GPU; checkpoint not seen) | RUNBOOK section 4 |
 | 3c stock-vLLM reference numbers | **not run** (no GPU, no vLLM) | `gate_c_vllm_reference.py`; written against the vLLM 0.9.1 sources, never executed |
 | 3d smoke, 3 steps | **not run** (no GPU) | `STEPS=3 EXP_NAME=sparsespec_smoke bash baseline/run_seed_sparsespec.sh` |
-| Reference-engine versions of 3b / 3c / smoke | **not run on GPU**; control flow exercised on CPU with a tiny random Qwen3 | RUNBOOK section 3 |
+| Reference-engine versions of 3b / 3c | **not run on GPU**; both gate scripts run on CPU with a tiny random Qwen3 (see "What was run") | RUNBOOK section 3 |
+| Reference-engine smoke, `integration/smoke_reference.sh` (patched verl end to end) | **never executed anywhere**: the Ray worker, the patched `_build_rollout` branch, `fit` and its console log have not run. On CPU only a copy of the worker's `generate_sequences`, the patch's trainer statement and the 3d checker (synthetic logs) were exercised | RUNBOOK section 3 |
+| `integration/setup_env.sh`; the `conda run` version loop | **never executed anywhere**; only the `patch` commands the script uses and its recorded hashes are covered by tests | RUNBOOK section 1 |
 
 Numbers to fill in on the box (leave blank until measured):
 
@@ -56,9 +62,12 @@ Numbers to fill in on the box (leave blank until measured):
 
 Review: five independent reviewers read the wrapper against upstream `serve/`, verl 0.5.0, vLLM 0.9.1 and
 torch 2.7 sources, and each finding was checked by a second reader. 20 findings were confirmed, none of
-them a wrong-result bug; all code-level ones are fixed on the branch (list under "Review fixes"). The
-log-prob row mapping, the EOS handling and the weight mapping were traced by hand and found correct.
-That is still reading, not running.
+them a wrong-result bug in the engine path; all code-level ones are fixed on the branch (list under
+"Review fixes"). The log-prob row mapping, the EOS handling and the weight mapping were traced by hand and
+found correct. A second pass over the fixes, the GPU-only gate paths and these two documents confirmed 14
+more issues, mostly wrong or incomplete instructions in the RUNBOOK; all are fixed except one latent case
+(the engine cannot be called from inside a caller's `with torch.device(...)` block on torch 2.7; verl never
+does that). All of this is still reading, not running.
 
 ### Versions
 
@@ -177,6 +186,12 @@ an optional `cpu_capacity` argument, and an O(1) double-free check for host page
   (hours per step) was advertised as a smoke test and is now refused by default.
 - Reference engine rounded Qwen3's rotary `inv_freq` to bf16, computed logits for every prompt position,
   and could strand KV-cache segments.
+- Second pass: the concurrency warning advised a `cpu_offload_ratio` that did not lift the cap (now
+  derived from the sizing code: about 5.6, locking 64 GiB); the engine's INFO lines were suppressed under
+  verl (the `serve.rl` logger is now kept at INFO); the GPU tests' KV-leak guard could never fire; the 3d
+  checker crashed on a missing baseline CSV; trainer-forward scoring in the gates peaked above its stated
+  memory budget; one CPU test was flaky; `setup_env.sh` could leave an env without verl after a failed
+  install.
 
 ## Fairness: what differs between the arms besides the decoding algorithm
 

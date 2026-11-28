@@ -32,6 +32,7 @@ source baseline/config/grpo_base.sh   # exports MODEL_PATH, DATA_DIR, CKPT_ROOT 
 ```bash
 bash integration/setup_env.sh              # creates verl-sparsespec-dev from verl-baseline, installs patched verl 0.5.0
 conda activate verl-sparsespec-dev
+python -m pip install pytest               # test runner for sections 2 and 4; no setup step or dependency installs it
 ```
 
 The script clones verl `v0.5.0` into `integration/.verl-0.5.0` (git-ignored), applies
@@ -45,8 +46,13 @@ It ends by printing the versions and whether the SparseSpec engine is importable
 ```bash
 bash integration/setup_env.sh verl-sparsespec     # only installs the patched verl into it
 conda activate verl-sparsespec
+python -m pip install pytest                      # test runner for sections 2 and 4
 python -c "import serve.rl.engine; print('SparseSpec engine importable')"
 ```
+
+`setup_env.sh` expects the target env to already contain verl 0.5.0 (true for any clone of `verl-baseline`)
+and has itself never been executed (no conda on the machine it was written on), so read its output on the
+first run.
 
 For Harrison's build (see STATUS.md, fairness): the engine needs the flashinfer fork, RAFT headers and
 `librmm.so` under `$CONDA_PREFIX`, plus `numba`, `jinja2`, `wandb`. It does **not** need the vLLM fork:
@@ -64,14 +70,17 @@ for env in verl-baseline verl-sparsespec; do
 done
 ```
 
-## 2. CPU tests (any of the envs, no GPU needed, about a minute)
+## 2. CPU tests (`verl-sparsespec-dev` or `verl-sparsespec`, no GPU needed, about a minute)
 
 ```bash
-python -m pytest serve/rl/tests integration/gates/tests -q
+python -m pytest serve/rl/tests integration/gates/tests -q --ignore=serve/rl/tests/test_engine_gpu.py
 ```
 
-Expected: everything passes; `serve/rl/tests/test_engine_gpu.py` is skipped where flashinfer is missing,
-and four tests of `test_verl_patch.py` skip in an env whose verl is already patched.
+Expected: everything passes; four tests of `test_verl_patch.py` skip in an env whose verl is already
+patched. `test_engine_gpu.py` is left out on purpose: without `--ignore` it is skipped only where CUDA or
+flashinfer is missing, so in `verl-sparsespec` this command would build the real engine on the shared card.
+Run it with the command in section 4. Do not run the tests in `verl-baseline`: pytest is not installed
+there and that env must not be modified.
 
 ## 3. Reference-engine plumbing (dev env, before the real engine exists)
 
@@ -110,7 +119,8 @@ FAIL. If a gate fails, stop and record the numbers; do not change thresholds to 
 
 ```bash
 nvidia-smi
-python -m pytest serve/rl/tests/test_engine_gpu.py -v -s 2>&1 | tee baseline/results/sparsespec_checks/engine_gpu_tests.log
+mkdir -p baseline/results/sparsespec_checks
+python -m pytest serve/rl/tests/test_engine_gpu.py -v -s --log-cli-level=INFO 2>&1 | tee baseline/results/sparsespec_checks/engine_gpu_tests.log
 ```
 
 One small engine (default share 0.25, `SPARSESPEC_TEST_MEM_FRACTION` to change; the module skips itself
@@ -121,7 +131,9 @@ greedy output after two cycles), KV pool clean after generate. The first run com
 flashinfer kernels, so it is slow once.
 
 Read the engine's log lines `SparseSpecEngine memory plan`, `ready in ...: X GiB resident while awake` and
-`asleep: freed ..., Y GiB still resident`, and copy them into STATUS.md.
+`asleep: freed ..., Y GiB still resident` (pytest shows them under "live log setup" / "live log call"; they
+need `--log-cli-level=INFO`), and copy them into STATUS.md. Do not use the test's own
+`[sleep N] allocated ...` line for the asleep figure: it is process-wide and includes the HF reference model.
 
 ### 3b. Greedy check
 
@@ -190,13 +202,23 @@ rule more power. The bitwise check does not depend on any of this.
 
 ```bash
 nvidia-smi          # needs the whole card, like a baseline run
+rm -rf "${CKPT_ROOT:?source baseline/config/grpo_base.sh first}/sparsespec_smoke"   # every attempt starts from scratch, see below
 STEPS=3 EXP_NAME=sparsespec_smoke bash baseline/run_seed_sparsespec.sh
 python -m integration.gates.gate_d_smoke_check --exp-name sparsespec_smoke --steps 3 --engine sparsespec \
     --baseline-csv baseline/results/smoke.timing.csv        # the baseline's smoke CSV, if it is on the box
 ```
 
 Pass = no OOM, three steps, `critic/score/mean` > 0 on some step, the six `sparsespec/*` columns present
-and sane. The checker prints the step-time comparison with the baseline smoke.
+and sane. The checker prints the step-time comparison with the baseline smoke when that CSV exists
+(otherwise a NOTE; the verdict does not depend on it).
+
+Every smoke attempt has to start without a checkpoint, hence the `rm -rf` (it only removes this smoke's own
+directory). A smoke that reaches step 3 saves `$CKPT_ROOT/sparsespec_smoke/global_step_3` (verl saves on the
+last step whenever `save_freq` > 0), and verl's default `trainer.resume_mode=auto` makes the next run with
+the same `EXP_NAME` resume from it: only `step:4` runs, the log and CSV are overwritten, and gate 3d fails
+with missing steps 1 to 3. A fresh `EXP_NAME` (and the same `--exp-name` for the checker) works too.
+
+The engine's `SparseSpecEngine ...` lines appear in the run log prefixed by the Ray worker name.
 
 Things to read in `baseline/logs/sparsespec_smoke.log` and the CSV before launching the real run:
 
@@ -213,6 +235,7 @@ Things to read in `baseline/logs/sparsespec_smoke.log` and the CSV before launch
 Optional, to quantify the CUDA-graph effect (the baseline's vLLM runs eager; see STATUS.md):
 
 ```bash
+rm -rf "${CKPT_ROOT:?source baseline/config/grpo_base.sh first}/sparsespec_eager_smoke"
 SPARSESPEC_CUDA_GRAPH=False STEPS=3 EXP_NAME=sparsespec_eager_smoke bash baseline/run_seed_sparsespec.sh
 ```
 
@@ -221,13 +244,40 @@ SPARSESPEC_CUDA_GRAPH=False STEPS=3 EXP_NAME=sparsespec_eager_smoke bash baselin
 After 3b, 3c and 3d pass:
 
 ```bash
+tmux new -s sparsespec          # from the repo root; the run takes about a day
+```
+
+Then inside the tmux session. It is a new shell: an env activated before `tmux new` does not carry over,
+and with an already running tmux server neither do exported `CKPT_ROOT` / `DATA_DIR` / `MODEL_PATH`.
+
+```bash
 conda activate verl-sparsespec
+echo "$CONDA_DEFAULT_ENV"       # must print verl-sparsespec
+# re-export any non-default CKPT_ROOT / DATA_DIR / MODEL_PATH here
 nvidia-smi
-tmux new -s sparsespec          # or nohup; the run takes about a day
 bash baseline/run_seed_sparsespec.sh
 # seed 0, 100 steps, checkpoints every 25 under $CKPT_ROOT/sparsespec_seed0/
 # log: baseline/logs/sparsespec_seed0.log    metrics: baseline/results/sparsespec_seed0.timing.csv
 ```
+
+Without tmux: `conda activate verl-sparsespec`, then `nohup bash baseline/run_seed_sparsespec.sh &` in the
+same shell.
+
+Restarting after a crash: re-running the same command resumes from the last checkpoint under
+`$CKPT_ROOT/sparsespec_seed0/` (step 25/50/75; from scratch if it died before step 25). That is intended,
+but the script truncates the log and rewrites the CSV, so the steps before that checkpoint would disappear
+from both. Move the log aside first and merge afterwards:
+
+```bash
+mv baseline/logs/sparsespec_seed0.log baseline/logs/sparsespec_seed0.attempt1.log
+cp baseline/results/sparsespec_seed0.timing.csv baseline/results/sparsespec_seed0.attempt1.timing.csv
+bash baseline/run_seed_sparsespec.sh
+# one CSV over all steps; for steps both attempts ran, the later (resumed) lines win
+cat baseline/logs/sparsespec_seed0.attempt1.log baseline/logs/sparsespec_seed0.log > baseline/logs/sparsespec_seed0.merged.log
+python baseline/parse_timing.py baseline/logs/sparsespec_seed0.merged.log -o baseline/results/sparsespec_seed0.timing.csv
+```
+
+`runs.jsonl` gets one entry per attempt; the run's GPU-hours are their sum.
 
 Afterwards, as for the baseline: `bash baseline/merge_checkpoints.sh sparsespec_seed0` and
 `bash baseline/eval_all.sh sparsespec_seed0` (in the baseline env: the offline eval uses stock vLLM for
@@ -235,12 +285,16 @@ both arms).
 
 ## 6. Knobs (all inside `actor_rollout_ref.rollout.sparsespec.*`)
 
-Add as `+actor_rollout_ref.rollout.sparsespec.<key>=<value>` in `SPARSESPEC_ARGS` of the run script.
+`max_batch_size` and `cuda_graph` are already set in `SPARSESPEC_ARGS` of `baseline/run_seed_sparsespec.sh`:
+change `max_batch_size` by editing the value on its existing line there, and `cuda_graph` with
+`SPARSESPEC_CUDA_GRAPH=False` in the environment. Do not add a second line for either: hydra stops with
+`Could not append to config. An item is already at ...`. The other four keys are not set by the script: add
+them as `+actor_rollout_ref.rollout.sparsespec.<key>=<value>` lines in `SPARSESPEC_ARGS`.
 
 | Key | Default | Effect |
 |---|---|---|
 | `max_batch_size` | 64 | upper bound on in-flight requests; reserves about 11 MiB of GPU memory each |
-| `cpu_offload_ratio` | 1.5 | host offload pool as a multiple of the GPU KV pool, then sized to a power-of-two pinned block: 1.5 locks 16 GiB of host RAM, 3.0 locks 32 GiB, 5.7 or more locks 64 GiB |
+| `cpu_offload_ratio` | 1.5 | host offload pool as a multiple of the GPU KV pool, then sized to a power-of-two pinned block: 1.5 locks 16 GiB of host RAM, 3.0 locks 32 GiB, about 5.6 or more locks 64 GiB (values in between fall back to the block below; the engine's warning prints the exact ratio for the card) |
 | `kv_capacity_tokens` | auto | GPU KV pool size; auto = what is left of the 0.45 share after weights, buffers, graphs and scratch |
 | `transient_reserve_gb` | 2.0 | GPU memory kept free for sampler / verification scratch |
 | `cuda_graph` | True | `SPARSESPEC_CUDA_GRAPH=False` in the run script's environment |

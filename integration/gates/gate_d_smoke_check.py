@@ -242,8 +242,15 @@ def main(argv=None) -> int:
 
     comparison = None
     comparison_table = ""
-    if args.baseline_csv:
-        base_path = os.path.abspath(os.path.expanduser(args.baseline_csv))
+    base_path = os.path.abspath(os.path.expanduser(args.baseline_csv)) if args.baseline_csv else None
+    if base_path and not os.path.isfile(base_path):
+        common.log("")
+        common.log(
+            f"[gate 3d] NOTE: baseline CSV {base_path} does not exist; skipping the step-time comparison "
+            "(it is not part of the verdict)"
+        )
+        base_path = None
+    if base_path:
         base_steps, _ = read_timing_csv(base_path)
         shared = [s for s in present_steps if s in base_steps]
         comparison = {"baseline_csv": base_path, "steps": shared, "metrics": {}}

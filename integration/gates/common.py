@@ -541,11 +541,19 @@ def hf_trainer_logprobs(
             logits.div_(temperature)
             for row, i in enumerate(chunk):
                 start, num = len(prompts[i]) - 1, len(responses[i])
-                # the logits at position t predict token t + 1; one row at a
-                # time (as verl's logprobs_from_logits_v2) to bound the float32 copy
-                row_logp = torch.log_softmax(logits[row, start : start + num].to(torch.float32), dim=-1)
                 labels = torch.tensor(list(responses[i]), dtype=torch.long, device=device)
-                out[i] = row_logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1).double().cpu().tolist()
+                picked = []
+                # the logits at position t predict token t + 1. The float32 copy and
+                # its log-softmax are made 512 positions at a time and dropped before
+                # the next slice (2 x 512 x vocab x 4 B = 0.58 GiB for Qwen3); a whole
+                # 2048-token row costs 3 x 1.16 GiB, because the previous row's result
+                # is still bound while the next one is built
+                for lo in range(0, num, 512):
+                    hi = min(lo + 512, num)
+                    piece = torch.log_softmax(logits[row, start + lo : start + hi].to(torch.float32), dim=-1)
+                    picked.append(piece.gather(-1, labels[lo:hi].unsqueeze(-1)).squeeze(-1))
+                    del piece
+                out[i] = torch.cat(picked).double().cpu().tolist()
         del logits
         if progress:
             log(f"[{progress}] scored {min(cursor, len(order))}/{len(order)} sequences")

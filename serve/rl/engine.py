@@ -60,6 +60,8 @@ from serve.rl.memory import (
     admission_capacity_tokens,
     check_prob_offsets,
     check_workload_fits,
+    host_pool_tokens,
+    pinned_block_bytes,
     plan_memory,
     request_token_need,
 )
@@ -163,6 +165,11 @@ class SparseSpecEngine(RolloutEngine):
         """
         if not logging.getLogger().hasHandlers():
             global_logging_config()
+        # `import verl` leaves the root logger at WARNING with a handler attached, so the guard above does
+        # nothing in a verl worker. The memory plan and the resident sizes are logged at INFO and the
+        # RUNBOOK tells the operator to read them: keep this package at INFO whatever the host chose
+        # (only serve.rl; upstream's scheduler logs a heartbeat at INFO every 100 iterations).
+        logging.getLogger("serve.rl").setLevel(logging.INFO)
         if kv_cache != "pillar":
             raise NotImplementedError(f"kv_cache={kv_cache!r}: the RL engine implements PillarAttn ('pillar') only")
         if batch_policy not in ("greedy", "naive"):
@@ -331,7 +338,12 @@ class SparseSpecEngine(RolloutEngine):
     @contextlib.contextmanager
     def _ctx(self):
         """Everything the engine does on the GPU runs in here: inference mode,
-        run_inference's torch defaults, and the engine's own RNG stream."""
+        run_inference's torch defaults, and the engine's own RNG stream.
+
+        Do not call the engine from inside a caller's ``with torch.device(...)``
+        block: on torch 2.7 that context is not tracked by
+        ``torch.set_default_device`` and ``ctx_torch_default`` cannot unwind
+        it cleanly (verl never does this)."""
         outer_rng = torch.cuda.get_rng_state(self.device)
         torch.cuda.set_rng_state(self._rng_state, self.device)
         # ctx_torch_default "restores" the default device with
@@ -722,20 +734,30 @@ class SparseSpecEngine(RolloutEngine):
             return
         self._warned_inflight_cap.add(key)
         plan = self.plan
+        kv, token_bytes = plan.kv_capacity_tokens, plan.kv_token_bytes
         reserve = plan.total_capacity_tokens - admit_cap
-        ratio = (self.max_batch_size * need + reserve - plan.kv_capacity_tokens) / plan.kv_capacity_tokens
+        host_needed = self.max_batch_size * need + reserve - kv
+        # plan_memory sizes the host pool with host_pool_tokens: a request below 15/16 of its power-of-two
+        # pinned block is shrunk to the block below, so advise a ratio whose request survives that sizing
+        block = pinned_block_bytes(host_needed * token_bytes)
+        request = max(host_needed, -(-(block - block // 16) // token_bytes))
+        ratio = -(-10 * request // kv) / 10  # rounded up to one decimal
+        while host_pool_tokens(int(kv * ratio), token_bytes) < host_needed:
+            ratio = round(ratio + 0.1, 1)
+        pinned = pinned_block_bytes(host_pool_tokens(int(kv * ratio), token_bytes) * token_bytes)
         logger.warning(
             "worst-case KV admission limits concurrency to %d in-flight requests although max_batch_size is %d: "
             "each request may need %d KV tokens and the pools hold %d (GPU) + %d (host). Realised concurrency is "
-            "logged as sparsespec/batch_size_mean. sparsespec.cpu_offload_ratio >= %.1f (about %.0f GiB of pinned "
-            "host RAM, locked in power-of-two blocks) would lift the cap to max_batch_size.",
+            "logged as sparsespec/batch_size_mean. sparsespec.cpu_offload_ratio >= %.1f (locks %.0f GiB of pinned "
+            "host RAM; the host pool is sized to power-of-two blocks, so a smaller ratio falls back to the block "
+            "below) would lift the cap to max_batch_size.",
             cap,
             self.max_batch_size,
             need,
-            plan.kv_capacity_tokens,
+            kv,
             plan.cpu_capacity_tokens,
             ratio,
-            ratio * plan.kv_capacity_tokens * plan.kv_token_bytes / GIB,
+            pinned / GIB,
         )
 
     def memory_report(self) -> dict:

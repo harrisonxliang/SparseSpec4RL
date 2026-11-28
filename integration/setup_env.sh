@@ -107,7 +107,8 @@ else
         git clone --depth 1 --branch v0.5.0 https://github.com/volcengine/verl.git "$VERL_SRC"
     fi
     apply_patch_in "$VERL_SRC"
-    pip uninstall -y verl >/dev/null
+    # No explicit `pip uninstall` first: pip builds the editable wheel before it removes the installed
+    # verl and rolls the removal back if the install step fails, so a failed build leaves the env usable.
     pip install --no-deps -e "$VERL_SRC"
 fi
 

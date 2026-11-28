@@ -1,6 +1,6 @@
 """GPU tests for ``serve.rl.engine.SparseSpecEngine`` (run on the A100 box).
 
-    PYTHONPATH=. python -m pytest serve/rl/tests/test_engine_gpu.py -v -s
+    PYTHONPATH=. python -m pytest serve/rl/tests/test_engine_gpu.py -v -s --log-cli-level=INFO
 
 The whole module is SKIPPED unless CUDA is available and the custom flashinfer
 build imports (nothing is stubbed). If both are there, a failure to import
@@ -177,7 +177,9 @@ def _no_kv_pool_leak(caplog):
     LOGS an error, so a page leak would be invisible in the pool counters
     afterwards. Every test therefore fails if that error was logged."""
     yield
-    leaks = [r.getMessage() for r in caplog.records if "KV pool not clean" in r.getMessage()]
+    # caplog.records is per phase: in teardown it no longer holds what the test body logged
+    records = caplog.get_records("setup") + caplog.get_records("call")
+    leaks = [r.getMessage() for r in records if "KV pool not clean" in r.getMessage()]
     assert not leaks, f"the engine leaked KV pages: {leaks}"
 
 

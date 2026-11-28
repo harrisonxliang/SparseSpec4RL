@@ -705,6 +705,7 @@ class _FaultyEngine:
         self._inner = inner
         self._fault = fault
         self._loads = 0
+        self._retired = []  # "realloc": the storages the parameter moved away from (see load_weights)
         # "stale_forward": generation keeps using the weights the engine was built with
         self._frozen = copy.deepcopy(inner.model) if fault == "stale_forward" else None
 
@@ -720,6 +721,9 @@ class _FaultyEngine:
         report = self._inner.load_weights(named_tensors)
         if self._fault == "realloc":  # correct values, but one parameter moved to new storage
             param = next(iter(self._inner.model.parameters()))
+            # keep the old storage alive: once freed, the allocator can hand the build address back to a later
+            # clone, and that reload's pointer check would then pass by coincidence
+            self._retired.append(param.data)
             param.data = param.data.clone()
         if self._fault == "corrupt_one_value" and self._loads == 2:  # one weight off by one bf16 step
             param = self._inner.model.model.norm.weight
@@ -946,6 +950,11 @@ def test_gate_d_passes_on_good_runs_and_compares_with_the_baseline(tmp_path):
     reference = _timing_csv(tmp_path, "good_reference", _verl_log("reference"))
     status, result = _gate_d(reference, tmp_path, "--steps", "3", "--engine", "reference")
     assert status == 0 and not _failed(result)
+
+    # a baseline CSV that is not on the box is a note, not a crash: the comparison is not part of the verdict
+    absent = str(tmp_path / "absent.timing.csv")
+    status, result = _gate_d(good, tmp_path, "--steps", "3", "--engine", "sparsespec", "--baseline-csv", absent)
+    assert status == 0 and result["pass"] is True and result["baseline_comparison"] is None
 
 
 @pytest.mark.parametrize(
