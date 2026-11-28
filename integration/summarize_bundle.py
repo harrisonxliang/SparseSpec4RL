@@ -3,6 +3,7 @@
 
     python3 integration/summarize_bundle.py <bundle dir> [--tarball PATH] [--out SUMMARY.txt]
     python3 integration/summarize_bundle.py --json-get FILE dotted.key   # helper used by the runner
+    python3 integration/summarize_bundle.py --rerun-step50 <bundle dir>  # the 3c step-50 rerun commands
 
 Pure standard library (Python >= 3.6), so it runs with whatever python3 the box
 has, outside any conda env. It must never crash on a missing or malformed file:
@@ -13,7 +14,9 @@ Bundle layout it reads (all written by the runner):
 
     env/facts.txt                key=value facts (host, GPU, RAM, paths)
     env/<conda env>/versions.txt "VERSION <module> <version>" / "PATCH ..." lines
-    status/NN_<stage>.status     key=value: name, status, reason, exit_status, seconds, note, skip_kind
+    status/NN_<stage>.status     key=value: name, status, reason, exit_status, seconds, note, skip_kind,
+                                 outcome (verdict | refused | no_verdict | crashed | timeout | empty)
+    REFUSED.txt                  one problem and its fix per line, when the runner refused to start
     logs/NN_<stage>.log          full stdout + stderr of the stage
     gates/*.json                 gate outputs (--out-dir of every gate)
     smoke/gates_smoke_<label>.timing.csv, smoke/baseline_smoke.timing.csv
@@ -29,6 +32,7 @@ import re
 import sys
 
 WIDTH = 110
+MAX_LINES = 46  # one screen; build_summary folds rows (compaction levels) until the summary fits
 NA = "n/a"
 
 SMOKE_LABELS = ("worst_case", "host_guard", "no_graph", "no_logprobs")
@@ -45,10 +49,29 @@ REQUIRED = (
 )
 
 UNDERPOWERED = "negative_control_underpowered"
+INCONCLUSIVE = "negative_control_inconclusive"
 UNDERPOWERED_SENTENCE = (
     "3c step-25 FAILED ONLY because the checkpoint is too close to the base model for the negative control "
-    "(failure_class negative_control_underpowered): not an engine failure."
+    "(negative_control_underpowered; engine noise within 2x stock vLLM's)."
 )
+INCONCLUSIVE_SENTENCE = (
+    "3c step-25 failed only on the negative control, and without a stock-vLLM reference a too-close checkpoint "
+    "cannot be told from a noisy engine (negative_control_inconclusive)."
+)
+# what a FAIL that is not a gate verdict is called in the VERDICT line (status file "outcome")
+OUTCOME_WORDS = {"refused": "REFUSED", "no_verdict": "no verdict", "crashed": "crashed", "timeout": "timed out"}
+HOST_RAM_WARN_GIB = 24.0  # the engine page-locks 16 GiB of host memory for its offload pool
+STEP50_REF = "baseline/results/sparsespec_checks/gate_c_vllm_reference_step50.json"
+RERUN_HEAD = ("Step-50 rerun: paste the lines below as they are (stock vLLM first, then the gate; both write to "
+              "the gates' default out-dir, not into this bundle).")
+RERUN_NOT_YET = "The step-50 checkpoint C does not exist yet: the baseline run saves it at step 50."
+# stages whose PASS row says nothing beyond PASS (folded into one line when the summary is too long)
+QUIET_PASS = ("env", "engine_import", "smoke_compare")
+# the gate JSON each stage writes into gates/ (gate_3b, gate_3c_vllm_reference and the 3d checks: see stage_gate_json)
+GATE_JSON = {"gate_3b_vllm": "gate_b_vllm_greedy.json",
+             "gate_3c_synthetic": "gate_c_reload_sparsespec_synthetic.json",
+             "gate_3c_step25": "gate_c_reload_sparsespec_step25.json",
+             "smoke_compare": "smoke_compare.json"}
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +201,7 @@ def wrap(text, width=WIDTH, indent="  ", max_lines=3):
         lines.append(indent + line)
     if len(lines) > max_lines:
         lines = lines[:max_lines]
-        lines[-1] = clip(lines[-1], width - 3) + "..." if not lines[-1].endswith("...") else lines[-1]
+        lines[-1] = lines[-1][: width - 3].rstrip(" .") + "..."
     return lines
 
 
@@ -241,12 +264,20 @@ PYTEST_COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed
 ERROR_LINE = re.compile(
     r"^\s*(?:[\w.]+\.)?(?:[A-Z]\w*(?:Error|Exception|Exit|Interrupt)|AssertionError|OutOfMemoryError)\b.*"
 )
+# a gate's own stop message ('[gate 3c] FAIL checkpoint not found', '[preflight] FAIL ...', '... CRASHED: ...')
+GATE_STOP_LINE = re.compile(r"^\s*\[(?:gate[^\]]*|preflight)\][^\n]*\b(?:FAIL|REFUSED|CRASHED)\b")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def plain(text):
+    """Text without ANSI color codes (pytest colors its output when FORCE_COLOR / PY_COLORS is set)."""
+    return ANSI_ESCAPE.sub("", text or "")
 
 
 def pytest_counts(log_text):
     """'12 passed, 1 skipped' style summary of the LAST pytest run in a log, or None."""
     last = None
-    for line in (log_text or "").splitlines():
+    for line in plain(log_text).splitlines():
         match = PYTEST_SUMMARY.match(line.strip())
         if match:
             last = match.group(1)
@@ -260,6 +291,7 @@ def pytest_counts(log_text):
 
 
 def pytest_text(log_text):
+    log_text = plain(log_text)
     counts = pytest_counts(log_text)
     if counts is None:
         return "pytest summary n/a"
@@ -273,13 +305,32 @@ def pytest_text(log_text):
     return text
 
 
-def last_error_line(log_text):
-    """The last traceback-looking line of a log (exception type + message), or None."""
-    found = None
-    for line in (log_text or "").splitlines()[-3000:]:
+def last_error_line(log_text, gate_lines=False):
+    """The last traceback-looking line of a log (exception type + message), or None. With
+    ``gate_lines``, a gate's own stop message ('[gate 3c] FAIL ...') when there is no such line."""
+    found = gate = None
+    for line in plain(log_text).splitlines()[-3000:]:
         if ERROR_LINE.match(line) or re.search(r"\bCUDA out of memory\b|\bKilled\b|\bSegmentation fault\b", line):
             found = line.strip()
-    return found
+        elif gate_lines and GATE_STOP_LINE.match(line):
+            gate = line.strip()
+    return found or gate
+
+
+COMMAND_END = re.compile(r"^\[run_all_gates\] \S+ exit status \d+ after ")
+NOT_THE_COMMAND = re.compile(r"^\s*(?:\[run_all_gates\]|ERROR conda\.|`conda run )")
+
+
+def last_output_line(log_text):
+    """The last line the stage's own command printed, or None: what a gate that stopped with
+    SystemExit("message") said last. Lines after the runner's "exit status" line (its own
+    bookkeeping) and conda run's "failed" notice do not count."""
+    lines = plain(log_text).splitlines()
+    ends = [i for i, line in enumerate(lines) if COMMAND_END.match(line)]
+    for line in reversed(lines[:ends[-1]] if ends else lines):
+        if line.strip() and not NOT_THE_COMMAND.match(line):
+            return line.strip()
+    return None
 
 
 def gate_3b_pairs(data):
@@ -322,6 +373,142 @@ def gate_3b_pairs(data):
             rule = rule.get("name") or rule.get("text")
         out.append((name, passed, diverged, earliest, margin, rule, total))
     return out
+
+
+def three_way_passed(bundle):
+    """Gate 3b is the three-way comparison (SparseSpec / HF / stock vLLM); the two-way fallback never passes it."""
+    data = bundle.gate_json("gate_b_greedy_three_way.json")
+    return bool(data) and data.get("three_way") is True and data.get("pass") is True
+
+
+def gate_3b_json(bundle):
+    return bundle.gate_json("gate_b_greedy_three_way.json") or bundle.gate_json("gate_b_greedy_sparsespec.json")
+
+
+def stage_gate_json(bundle, name):
+    """The gate JSON a stage writes (None when the stage has none or it was not written)."""
+    if name == "gate_3b":
+        return gate_3b_json(bundle)
+    if name in GATE_JSON:
+        return bundle.gate_json(GATE_JSON[name])
+    if name == "gate_3c_vllm_reference":
+        hits = sorted(h for h in glob.glob(bundle.path("gates", "gate_c_vllm_reference*.json"))
+                      if not h.endswith(".samples.json"))
+        return read_json(hits[-1]) if hits else None
+    if name.startswith("smoke_") and name.endswith("_check"):
+        return bundle.gate_json("gate_d_smoke_%s%s.json" % (SMOKE_PREFIX, name[len("smoke_"): -len("_check")]))
+    return None
+
+
+def stage_outcome(bundle, entry):
+    """How a FAILed stage ended: verdict | refused | no_verdict | crashed | timeout | '' (not a gate).
+
+    The runner writes it into the status file ("outcome"); a gate JSON that says "refused": true
+    counts as refused whatever the status file says (it is the gate's own word)."""
+    outcome = entry.get("outcome", "")
+    if entry.get("status") == "FAIL" and outcome != "refused":
+        data = stage_gate_json(bundle, entry.get("name", ""))
+        if isinstance(data, dict) and data.get("refused") is True:
+            return "refused"
+    return outcome
+
+
+def gate_3b_failed_lines(data):
+    """Why a gate_b_greedy JSON with "pass": false failed: failed checks + blame, and the R2 numbers.
+
+    A three-way pair's ``pass`` covers only R1 and the strict-prefix check of that pair, so a FAIL from
+    R2 or a response contract leaves every pair line at PASS; these lines name the check. A refusal is
+    shown by the caller (from the stage's status).
+    """
+    if not isinstance(data, dict) or data.get("pass") is not False or data.get("refused"):
+        return []
+    items = []
+    if isinstance(data.get("failed_checks"), list):  # three-way: [{"name": ..., "blame": [...]}]
+        for item in data["failed_checks"]:
+            if isinstance(item, dict):
+                who = item.get("blame") if isinstance(item.get("blame"), list) else []
+                items.append((str(item.get("name")), who))
+            elif item is not None:
+                items.append((str(item), []))
+    elif isinstance(data.get("checks"), list):  # two-way: only "checks"
+        items = [(str(c.get("name")), []) for c in data["checks"] if isinstance(c, dict) and c.get("ok") is False]
+    if not items:
+        return ["failed checks not recorded in the gate JSON: see gates/gate_b_greedy_*.md"]
+    out = ["failed: " + "; ".join(("%s [%s]" % (n, ",".join(str(b) for b in who))) if who else n for n, who in items)]
+    profile = dig(data, "three_way_result", "profile")
+    if isinstance(profile, dict) and any(n.startswith("R2_") for n, _ in items):
+        eng, ref = dig(profile, "engine"), dig(profile, "vllm")
+        eng, ref = eng if isinstance(eng, dict) else {}, ref if isinstance(ref, dict) else {}
+        p, alpha = num(profile.get("p_value")), num(profile.get("alpha"))
+        out.append("R2 %s: diverging prompts %s %s / vLLM %s, earliest %s / %s, p %s %s %s" % (
+            profile.get("rule") or NA, dig(data, "config", "engine") or "engine", fmt_int(eng.get("divergences")),
+            fmt_int(ref.get("divergences")),
+            "none" if num(eng.get("earliest")) is None else fmt_int(eng.get("earliest")),
+            "none" if num(ref.get("earliest")) is None else fmt_int(ref.get("earliest")),
+            fmt(p), "vs" if p is None or alpha is None else "<" if p < alpha else ">=", fmt(alpha)))
+    return out
+
+
+def shell_lines(tokens, width=WIDTH, indent="  "):
+    """One shell command as lines of at most ``width`` columns that paste as they are: ' \\'
+    continuations between words; a word too long for a line (a long path) is split by a
+    backslash-newline and goes on at column 0, which the shell joins back into the same word."""
+    room = width - 2
+    lines, cur = [], ""
+    for tok in tokens:
+        cand = (cur + " " + tok) if cur.strip() else (cur + tok)
+        if len(cand) <= room:
+            cur = cand
+            continue
+        if cur.strip():
+            lines.append(cur + " \\")
+            cur = indent
+            if len(cur) + len(tok) <= room:
+                cur += tok
+                continue
+        rest = tok
+        splittable = re.match(r"^[\w@%+=:,./-]+$", tok) is not None
+        while splittable and len(cur) + len(rest) > room:
+            take = min(width - 1 - len(cur), len(rest) - 1)  # never leave an empty tail: the next word needs its space
+            lines.append(cur + rest[:take] + "\\")
+            cur, rest = "", rest[take:]
+        cur += rest
+    lines.append(cur)
+    return lines
+
+
+def shell_word(text):
+    text = str(text)
+    return text if re.match(r"^[\w@%+=:,./-]+$", text) else "'" + text.replace("'", "'\\''") + "'"
+
+
+def rerun_step50(bundle):
+    """(head sentence, shell lines): the rerun of gate 3c on the step-50 checkpoint.
+
+    The lines paste as they are, from any directory: the stock-vLLM reference first (baseline env),
+    then the reload gate with --vllm-reference (SparseSpec env). No --out-dir, so both write to the
+    gates' default out-dir (baseline/results/sparsespec_checks/ of the repo), never into this bundle.
+    Each long path is assigned to a shell variable once, so the commands stay the same few lines
+    whatever the paths are. DATA_DIR / MODEL_PATH are passed only when the gate run did not use the
+    defaults of baseline/config/grpo_base.sh (facts rerun_data_dir / rerun_model_path)."""
+    f = bundle.facts
+    repo = f.get("repo_root") or "<repo>"
+    ckpt = f.get("step50_ckpt") or "<CKPT_ROOT>/vllm_baseline_seed0/hf/global_step_50"
+    sp, bl = f.get("sparsespec_env") or "verl-sparsespec", f.get("baseline_env") or "verl-baseline"
+    head = RERUN_HEAD if f.get("step50_ckpt_exists") == "yes" else RERUN_HEAD + " " + RERUN_NOT_YET
+    lines = shell_lines(["cd", shell_word(repo)]) + shell_lines(["C=" + shell_word(ckpt)])
+    envs = ["env", "PYTHONPATH=."]
+    for var, key, short in (("DATA_DIR", "rerun_data_dir", "D"), ("MODEL_PATH", "rerun_model_path", "M")):
+        if f.get(key):
+            lines += shell_lines(["%s=%s" % (short, shell_word(f[key]))])
+            envs.append('%s="$%s"' % (var, short))
+    pre = [shell_word(f.get("conda_cmd") or "conda"), "run", "--no-capture-output", "-n"]
+    lines += shell_lines(pre + [shell_word(bl)] + envs + ["python", "integration/gates/gate_c_vllm_reference.py",
+                                                         "--ckpt", '"$C"', "--tag", "step50"])
+    lines += shell_lines(pre + [shell_word(sp)] + envs + ["python", "-m", "integration.gates.gate_c_reload",
+                                                         "--engine", "sparsespec", "--ckpt", '"$C"', "--tag",
+                                                         "sparsespec_step50", "--vllm-reference", STEP50_REF])
+    return head, lines
 
 
 def gate_3c_text(data):
@@ -488,8 +675,7 @@ def stage_result(bundle, entry):
         log_text = read_tail(bundle.log_path(name) or "")
         text = pytest_text(log_text)
     elif name == "gate_3b":
-        data = bundle.gate_json("gate_b_greedy_three_way.json") or bundle.gate_json("gate_b_greedy_sparsespec.json")
-        pairs = gate_3b_pairs(data)
+        pairs = gate_3b_pairs(gate_3b_json(bundle))
         text = (note or "mode n/a") if pairs else "%s; gate JSON n/a" % (note or "mode n/a")
     elif name == "gate_3b_vllm":
         data = bundle.gate_json("gate_b_vllm_greedy.json")
@@ -499,9 +685,7 @@ def stage_result(bundle, entry):
     elif name == "gate_3c_step25":
         text = gate_3c_text(bundle.gate_json("gate_c_reload_sparsespec_step25.json"))
     elif name == "gate_3c_vllm_reference":
-        hits = sorted(glob.glob(bundle.path("gates", "gate_c_vllm_reference*.json")))
-        hits = [h for h in hits if not h.endswith(".samples.json")]
-        text = vllm_ref_text(read_json(hits[-1]) if hits else None)
+        text = vllm_ref_text(stage_gate_json(bundle, name))
     elif name.startswith("smoke_") and name.endswith("_check"):
         label = name[len("smoke_"): -len("_check")]
         text = smoke_check_text(bundle.gate_json("gate_d_smoke_%s%s.json" % (SMOKE_PREFIX, label)))
@@ -516,6 +700,16 @@ def stage_result(bundle, entry):
         text = note or "recorded in env/"
     else:
         text = note or ""
+    outcome = stage_outcome(bundle, entry)
+    if status == "FAIL" and outcome == "refused":  # the gate's reason goes on the next line (stage_detail_lines)
+        what = "inputs do not match; nothing was compared" if name == "gate_3b" else "nothing was compared"
+        return "REFUSED (%s) | exit %s" % (what, entry.get("exit_status") or NA)
+    if status == "FAIL" and outcome in ("no_verdict", "crashed"):
+        # not a verdict: say so in full (the row is too narrow for more); the gate's own last message
+        # or the exception line goes on the next line (stage_detail_lines)
+        short = re.sub(r"^exit (\d+) \(crashed or did not start\)", r"exit \1 (crash, no verdict)", reason or outcome)
+        short = short.replace("; see the log)", ")").replace(", traceback in the log; no verdict)", "; no verdict)")
+        return short
     if status == "FAIL":
         if log_text is None:
             log_text = read_tail(bundle.log_path(name) or "")
@@ -544,7 +738,69 @@ def env_line(bundle, env_name):
     return "%s: %s" % (env_name, " ".join(parts))
 
 
-def build_summary(bundle, tarball=None):
+def stage_detail_lines(bundle, entry):
+    """Lines under a stage's row: why a gate refused, what a gate without a verdict last said (its own
+    stop message or the exception line of a crash), and for gate 3b the per-pair results and the failed checks."""
+    name, status = entry["name"], entry.get("status", "")
+    outcome = stage_outcome(bundle, entry) if status == "FAIL" else ""
+    lines = []
+    if outcome == "refused":
+        data = stage_gate_json(bundle, name)
+        why = (data.get("reason") if isinstance(data, dict) else None) or re.sub(
+            r"^REFUSED \([^)]*\): ", "", entry.get("reason", "")) or NA
+        lines.extend(wrap("REFUSED: " + str(why).replace(bundle.root + os.sep, ""), indent="    ", max_lines=2))
+    elif outcome in ("no_verdict", "crashed"):
+        log_text = read_tail(bundle.log_path(name) or "")
+        error = last_error_line(log_text, gate_lines=True) or last_output_line(log_text)
+        lines.append(clip("    " + (error or "nothing printed: see %s" % (entry.get("log") or "the stage log"))))
+    if name == "gate_3b" and status != "SKIP":
+        data = gate_3b_json(bundle)
+        for pair, passed, diverged, earliest, margin, rule, count in gate_3b_pairs(data)[:3]:
+            lines.append(clip("    3b %-24s %s  diverged %s/%s, earliest at %s, largest margin %s, rule %s" % (
+                pair[:24], "PASS" if passed is True else "FAIL" if passed is False else "    ",
+                fmt_int(diverged), fmt_int(count), earliest if isinstance(earliest, str) else fmt_int(earliest),
+                fmt(margin), rule or NA)))
+        if outcome != "refused":
+            for why in gate_3b_failed_lines(data):
+                lines.extend(wrap(why, indent="    3b ", max_lines=2))
+    return lines
+
+
+def folded_gpu_row(bundle, names):
+    """One row for the GPU unit-test stages when all of them passed (values in stage order)."""
+    passed, times, total = [], [], 0.0
+    for name in names:
+        counts = pytest_counts(read_tail(bundle.log_path(name) or "")) or {}
+        passed.append(str(counts["passed"]) if "passed" in counts else NA)
+        seconds = num((bundle.by_name.get(name) or {}).get("seconds"))
+        times.append(fmt_duration(seconds))
+        total += seconds or 0.0
+    return "%-33s %-4s %6s  in stage order: %s passed, %s" % (
+        "gpu_unit_tests + %d variants" % (len(names) - 1), "PASS", fmt_duration(total), "/".join(passed), "/".join(times))
+
+
+def folded_smoke_row(bundle, names):
+    """One row for the smoke runs that passed together with their 3d check (their numbers are in the table)."""
+    times, total = [], 0.0
+    for name in names:
+        seconds = num((bundle.by_name.get(name) or {}).get("seconds"))
+        times.append(fmt_duration(seconds))
+        total += seconds or 0.0
+    which = "all %d, in table order" % len(names) if len(names) == len(SMOKE_LABELS) else "/".join(
+        name[len("smoke_"):] for name in names)
+    return "%-33s %-4s %6s  %s: %s" % ("smoke runs, 3d check PASS", "PASS", fmt_duration(total), which, "/".join(times))
+
+
+def summary_lines(bundle, tarball=None, level=0):
+    """(lines, verdict) at one compaction level. Level 0 shows everything; each further level folds
+    more (nothing is lost before level 5):
+      1  the GPU unit-test stages, when all of them passed, share one row
+      2  the smoke runs that passed with a passing 3d check share one row (the table has their numbers)
+      3  PASS rows that say nothing more than PASS (QUIET_PASS) share one line
+      4  no rule lines
+      5  the worst_case reading line goes, the cpu_offload_ratio note is cut to one line
+      6  the step-50 rerun commands are replaced by a pointer to the step-25 stage log
+    """
     f = bundle.facts
     lines = []
     lines.append(clip("SparseSpec gate run  host %s  commit %s (%s)  started %s  total %s" % (
@@ -562,31 +818,66 @@ def build_summary(bundle, tarball=None):
     lines.append(clip("env " + env_line(bundle, f.get("baseline_env"))))
     if f.get("timeout_bin") in (None, "", "none"):
         lines.append("WARNING: no timeout command on this host: a hanging stage was not stopped")
-    if f.get("refused"):
+    if mem_avail is not None and mem_avail < HOST_RAM_WARN_GIB:
+        lines.append(clip("WARNING: only %s GiB host RAM available at start (< %g GiB): the engine page-locks 16 GiB "
+                          "for its offload pool" % (fmt(mem_avail, 3), HOST_RAM_WARN_GIB)))
+    if f.get("prefix_override"):
+        lines.append(clip("NOTE: " + f["prefix_override"]))
+    refused = [x.strip() for x in (read_text(bundle.path("REFUSED.txt")) or "").splitlines() if x.strip()]
+    if refused:
+        lines.append("REFUSED TO START (exit 2; nothing GPU-related ran). Fix each problem, then rerun:")
+        for item in refused[:5]:  # "<problem>. Fix: <command>": the fix is never the part that gets cut
+            problem, sep, fix = item.partition(" Fix: ")
+            lines.extend(wrap("- " + problem, indent="  ", max_lines=3))
+            if sep:
+                lines.extend(wrap("Fix: " + fix, indent="    ", max_lines=2))
+    elif f.get("refused"):
         lines.append(clip("REFUSED TO START: " + f.get("refused")))
     errors = read_text(bundle.path("runner_errors.txt"))
     if errors and errors.strip():
         lines.append(clip("runner: %d unexpected command failure(s) inside run_all_gates.sh, see runner_errors.txt"
                           % len(errors.strip().splitlines())))
-    lines.append("-" * WIDTH)
+    rule = ["-" * WIDTH] if level < 4 else []
+    lines.extend(rule)
     lines.append("%-33s %-4s %6s  %s" % ("stage", "res", "time", "result"))
+
+    gpu_names = [n for n in REQUIRED[0][1] if n in bundle.by_name]
+    fold_gpu = gpu_names if level >= 1 and len(gpu_names) > 1 and all(bundle.status(n) == "PASS" for n in gpu_names) else []
+    fold_smoke = ["smoke_" + label for label in SMOKE_LABELS
+                  if bundle.status("smoke_" + label) == "PASS" and bundle.status("smoke_%s_check" % label) == "PASS"]
+    fold_smoke = fold_smoke if level >= 2 and len(fold_smoke) > 1 else []
+    quiet = []      # level 3: (name, time) of PASS rows that say nothing more
+    collapsed = []  # (kind, reason, name): stages that did not run at all, one line per kind
     for entry in bundle.stages:
-        if entry["name"].startswith("smoke_") and entry["name"].endswith("_check"):
+        name, status = entry["name"], entry.get("status", "")
+        if name.startswith("smoke_") and name.endswith("_check"):
             continue  # shown on its smoke run's line
-        prefix = "%-33s %-4s %6s  " % (entry["name"][:33], entry.get("status", "?")[:4], fmt_duration(entry.get("seconds")))
+        if status == "SKIP" and entry.get("skip_kind") in ("not_run", "not_selected"):
+            collapsed.append((entry.get("skip_kind"), entry.get("reason") or "not run", name))
+            continue
+        if name in fold_gpu or name in fold_smoke:
+            group = fold_gpu if name in fold_gpu else fold_smoke
+            if name == group[0]:
+                lines.append(clip(folded_gpu_row(bundle, group) if group is fold_gpu else folded_smoke_row(bundle, group)))
+            continue
+        if level >= 3 and status == "PASS" and name in QUIET_PASS:
+            quiet.append("%s %s" % (name, fmt_duration(entry.get("seconds"))))
+            continue
+        prefix = "%-33s %-4s %6s  " % (name[:33], status[:4] or "?", fmt_duration(entry.get("seconds")))
         result = stage_result(bundle, entry)
-        check = bundle.by_name.get(entry["name"] + "_check")
-        if check is not None and entry["name"].startswith("smoke_"):
+        check = bundle.by_name.get(name + "_check")
+        if check is not None and name.startswith("smoke_"):
             result += " | check %s %s" % (check.get("status", "?"), stage_result(bundle, check))
         lines.append(clip(prefix + result))
-        if entry["name"] == "gate_3b" and entry.get("status") != "SKIP":
-            data = bundle.gate_json("gate_b_greedy_three_way.json") or bundle.gate_json("gate_b_greedy_sparsespec.json")
-            for name, passed, diverged, earliest, margin, rule, count in gate_3b_pairs(data)[:3]:
-                lines.append(clip("    3b %-24s %s  diverged %s/%s, earliest at %s, largest margin %s, rule %s" % (
-                    name[:24], "PASS" if passed is True else "FAIL" if passed is False else "    ",
-                    fmt_int(diverged), fmt_int(count), earliest if isinstance(earliest, str) else fmt_int(earliest),
-                    fmt(margin), rule or NA)))
-    lines.append("-" * WIDTH)
+        lines.extend(stage_detail_lines(bundle, entry))
+    if quiet:
+        lines.append(clip("PASS, nothing to add: " + ", ".join(quiet)))
+    for kind in ("not_run", "not_selected"):
+        names = [n for k, _, n in collapsed if k == kind]
+        if names:
+            why = next(r for k, r, _ in collapsed if k == kind)
+            lines.extend(wrap("%d stage(s) SKIP, %s: %s" % (len(names), why, " ".join(names)), indent="", max_lines=2))
+    lines.extend(rule)
 
     # smoke table
     rows = []
@@ -621,23 +912,27 @@ def build_summary(bundle, tarball=None):
     note = find_offload_note(compare) if compare and not rows_text else None
     reading = run_reading(compare, "worst_case") if compare else None
     if rows_text:
-        lines.extend(wrap(rows_text, indent="", max_lines=2))
-        if reading:
+        lines.extend(wrap(rows_text, indent="", max_lines=2 if level < 5 else 1))
+        if reading and level < 5:
             lines.append(clip("worst_case reading: " + reading))
     elif note:
-        lines.extend(wrap("cpu_offload_ratio: " + note, indent="", max_lines=2))
+        lines.extend(wrap("cpu_offload_ratio: " + note, indent="", max_lines=2 if level < 5 else 1))
     else:
         lines.append(clip("cpu_offload_ratio note: n/a (smoke_compare JSON missing or has no note); host RAM %s GiB total, "
                           "%s GiB available" % (fmt(mem_total, 4), fmt(mem_avail, 4))))
 
-    # underpowered negative control: say it explicitly
+    # only the negative control failed at step 25: say it explicitly and give the step-50 rerun
     step25 = bundle.gate_json("gate_c_reload_sparsespec_step25.json")
-    if step25 and step25.get("pass") is False and step25.get("failure_class") == UNDERPOWERED:
-        nxt, step = dig(step25, "rerun", "next_ckpt"), dig(step25, "rerun", "next_step")
-        rerun = (" Rerun on the step-%s checkpoint (commands in gates/gate_c_reload_sparsespec_step25.md): %s"
-                 % (step if step is not None else "50", nxt) if nxt else
-                 " Rerun on a later checkpoint: see gates/gate_c_reload_sparsespec_step25.md.")
-        lines.extend(wrap(UNDERPOWERED_SENTENCE + rerun, indent="", max_lines=3))
+    if step25 and step25.get("pass") is False and step25.get("failure_class") in (UNDERPOWERED, INCONCLUSIVE):
+        sentence = UNDERPOWERED_SENTENCE if step25.get("failure_class") == UNDERPOWERED else INCONCLUSIVE_SENTENCE
+        head, commands = rerun_step50(bundle)
+        if level < 6:
+            lines.extend(wrap(sentence + " " + head, indent="", max_lines=5))
+            lines.extend(commands)
+        else:
+            log = (bundle.by_name.get("gate_3c_step25") or {}).get("log") or "the gate_3c_step25 stage log"
+            lines.extend(wrap("%s Rerun on the step-50 checkpoint: the two commands to paste (stock vLLM first, then the "
+                              "gate) are at the end of %s." % (sentence, log), indent="", max_lines=4))
 
     # verdict
     verdict, parts, failed = "PASS", [], []
@@ -648,11 +943,23 @@ def build_summary(bundle, tarball=None):
             parts.append("3c step-25 not run (no checkpoint)")
             continue
         if statuses and all(s == "PASS" for s in statuses):
+            if label == "3b" and not three_way_passed(bundle):
+                # gate 3b is the three-way gate; a two-way (engine vs HF) pass does not count
+                verdict = "FAIL"
+                parts.append("3b two-way only (three-way NOT DONE, gate_3b_vllm %s)"
+                             % (bundle.status("gate_3b_vllm") or "not run"))
+                failed.append(label)
+                continue
             parts.append("%s PASS" % label)
             continue
         verdict = "FAIL"
+        outcomes = [stage_outcome(bundle, e) for e in entries if e.get("status") == "FAIL"]
         if label == "3c step-25" and step25 and step25.get("failure_class") == UNDERPOWERED:
             word = "FAIL (underpowered)"
+        elif label == "3c step-25" and step25 and step25.get("failure_class") == INCONCLUSIVE:
+            word = "FAIL (inconclusive)"
+        elif outcomes and all(o in OUTCOME_WORDS for o in outcomes):
+            word = OUTCOME_WORDS[outcomes[0]]
         elif "FAIL" in statuses:
             word = "FAIL"
         elif all(s in ("", None) for s in statuses):
@@ -661,12 +968,29 @@ def build_summary(bundle, tarball=None):
             word = "not run" if all(s in ("SKIP", "", None) for s in statuses) else "incomplete"
         parts.append("%s %s" % (label, word))
         failed.append(label)
-    if f.get("refused"):
+    if f.get("refused") or refused:
         verdict = "FAIL"
     head = "VERDICT: ALL REQUIRED GATES PASSED" if verdict == "PASS" else "VERDICT: NOT PASSED"
     lines.extend(wrap("%s - %s" % (head, "; ".join(parts)), indent="", max_lines=2))
     lines.append("send this file back: %s" % (tarball or NA))
     return lines, verdict
+
+
+def build_summary(bundle, tarball=None):
+    """(lines, verdict) of the summary: the fullest layout that fits one screen (MAX_LINES).
+
+    If even the most compact layout is too long (many failures at once), the middle is cut and says
+    so; the verdict and the tarball line always stay."""
+    lines, verdict = [], "FAIL"
+    for level in range(7):
+        lines, verdict = summary_lines(bundle, tarball, level)
+        if len(lines) <= MAX_LINES:
+            return lines, verdict
+    tail = len(lines) - max(i for i, line in enumerate(lines) if line.startswith("VERDICT:"))
+    keep = MAX_LINES - tail - 1
+    cut = len(lines) - tail - keep
+    marker = "... %d more line(s) cut to keep this one screen: see status/ and logs/ in the bundle ..." % cut
+    return lines[:keep] + [marker] + lines[-tail:], verdict
 
 
 def json_get(path, dotted):
@@ -688,9 +1012,14 @@ def main(argv=None):
     parser.add_argument("--tarball", default=None, help="path printed on the 'send this file back' line")
     parser.add_argument("--out", default=None, help="where to write the summary (default: <bundle>/SUMMARY.txt)")
     parser.add_argument("--json-get", nargs=2, metavar=("FILE", "KEY"), help="print one scalar from a JSON file")
+    parser.add_argument("--rerun-step50", metavar="BUNDLE", help="print the gate 3c step-50 rerun commands")
     args = parser.parse_args(argv)
     if args.json_get:
         return json_get(*args.json_get)
+    if args.rerun_step50:
+        head, commands = rerun_step50(Bundle(args.rerun_step50))
+        sys.stdout.write("\n".join(wrap(head, indent="", max_lines=4) + commands) + "\n")
+        return 0
     if not args.bundle:
         parser.error("bundle directory required")
     bundle = Bundle(args.bundle)
