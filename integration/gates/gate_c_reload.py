@@ -63,12 +63,18 @@ Failure classification (JSON ``failure_class``; the verdict and exit status
 are NOT changed by it): ``null`` on PASS; ``"negative_control_underpowered"``
 when the ONLY failed check is the mean-based negative control, every other
 check (bitwise / pointer / tied / fingerprint / response contract / means /
-same range) passed, and HF(base) vs HF(checkpoint) themselves differ by no
-more than the rule demands, i.e. no engine could have satisfied it: the
-checkpoint is too close to the base model. The JSON, the markdown and the
-console then say so, with the numbers, what the tracking coefficients say,
-and the rerun command for a later checkpoint (``.../hf/global_step_50`` when
-``--ckpt`` ends in ``global_step_<N>``). ``"engine"`` for every other failure.
+same range) passed, HF(base) vs HF(checkpoint) themselves differ by no
+more than the rule demands, and ``--vllm-reference`` (stock vLLM, same
+checkpoint, same --max-new-tokens) shows that this engine's reloaded mean is
+within --same-range-factor of stock vLLM's and that an engine with stock
+vLLM's noise could not satisfy the rule either: the checkpoint is too close
+to the base model. The JSON, the markdown and the console then say so, with
+the numbers, what the tracking coefficients say, and the rerun command for a
+later checkpoint (``.../hf/global_step_50`` when ``--ckpt`` ends in
+``global_step_<N>``). ``"negative_control_inconclusive"`` for the same
+failure without a usable reference (the rule's bar is factor x THIS engine's
+own noise, so a noisy engine raises it; tracking does not see noise).
+``"engine"`` for every other failure.
 ``failed_checks`` lists the names of the failed checks.
 """
 
@@ -205,6 +211,7 @@ def stat_line(name: str, stats: dict) -> str:
 # ----------------------------------------------------------------------------
 FAILURE_UNDERPOWERED = "negative_control_underpowered"
 FAILURE_ENGINE = "engine"
+FAILURE_INCONCLUSIVE = "negative_control_inconclusive"
 # the mean-based negative-control rule(s): the only checks an underpowered checkpoint may fail
 MEAN_RULE_CHECKS = ("negative_control_clearly_larger",)
 # every one of these must be present AND pass before a failure may be blamed on the checkpoint
@@ -232,14 +239,23 @@ ENGINE_CHECKS = (
 )
 
 
-def classify_failure(check_items, *, neg_control_mode: str, mean_rule_ok: bool, distance: float, needed: float):
-    """``(failure_class, reason)``: ``(None, ...)`` when every check passed,
+def classify_failure(
+    check_items, *, neg_control_mode: str, mean_rule_ok: bool, distance: float, needed: float,
+    reloaded_mean: float = math.nan, reference: dict | None = None, neg_control_factor: float = 3.0,
+    noise_floor: float = 1e-4, max_noise_ratio: float = 2.0,
+):  # fmt: skip
+    """``(failure_class, reason)``: ``(None, ...)`` when every check passed;
     ``(FAILURE_UNDERPOWERED, ...)`` when the gate failed ONLY on the mean-based
-    negative control and HF(base) vs HF(checkpoint) differ by no more than that
-    rule demands (``distance <= needed``: no engine could satisfy it), and
-    ``(FAILURE_ENGINE, ...)`` for every other failure. Conservative: anything
-    unexpected (a missing engine check, non-finite numbers, tracking mode) is
-    ``engine``."""
+    negative control, HF(base) vs HF(checkpoint) differ by no more than that
+    rule demands (``distance <= needed``), and a stock-vLLM reference on the
+    same checkpoint (``reference = {"mean", "usable"}``) shows that the engine
+    is as precise as a correct one (``reloaded_mean <= max_noise_ratio x``
+    vLLM's mean) and that an engine with vLLM's noise fails the rule too
+    (``distance <= neg_control_factor x`` vLLM's mean);
+    ``(FAILURE_INCONCLUSIVE, ...)`` for the same failure without a usable
+    reference; ``(FAILURE_ENGINE, ...)`` for every other failure. Conservative:
+    anything unexpected (a missing engine check, non-finite numbers, tracking
+    mode) is ``engine``."""
     failed = [c["name"] for c in check_items if not c["ok"]]
     if not failed:
         return None, "all checks passed"
@@ -261,9 +277,37 @@ def classify_failure(check_items, *, neg_control_mode: str, mean_rule_ok: bool, 
             f"HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} > the required {common.fmt_num(needed)}: "
             "a correct engine could have satisfied the mean rule"
         )
+    # `needed` is factor x THIS engine's reloaded mean: a noisy engine raises its own bar, and the tracking
+    # coefficients do not see noise. Blame the checkpoint only when stock vLLM on the same checkpoint shows
+    # that this engine is about as precise as a correct one AND that such an engine fails the rule too.
+    ref_mean = (reference or {}).get("mean")
+    if not (reference and reference.get("usable") and isinstance(ref_mean, (int, float)) and math.isfinite(ref_mean)):
+        why = (reference or {}).get("why_unusable") or "no --vllm-reference was given"
+        return FAILURE_INCONCLUSIVE, (
+            f"only the mean rule failed and HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} <= the "
+            f"required {common.fmt_num(needed)}, but that bar is {neg_control_factor:g} x THIS engine's reloaded mean; "
+            f"without a stock-vLLM reference on the same checkpoint ({why}) the gate cannot tell a checkpoint too "
+            "close to the base model from an engine with inflated log-prob noise. Run gate_c_vllm_reference.py "
+            "--ckpt <this checkpoint> in the baseline env and rerun with --vllm-reference <its JSON>"
+        )
+    ref_floor = max(ref_mean, noise_floor)
+    if not (math.isfinite(reloaded_mean) and reloaded_mean <= max_noise_ratio * ref_floor):
+        return FAILURE_ENGINE, (
+            f"reloaded mean {common.fmt_num(reloaded_mean)} is more than {max_noise_ratio:g} x stock vLLM's "
+            f"{common.fmt_num(ref_mean)} on the same checkpoint: the engine's log-probs are noisier than a correct "
+            "engine's, which is what raised the negative-control bar"
+        )
+    if distance > neg_control_factor * ref_floor:
+        return FAILURE_ENGINE, (
+            f"HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} > {neg_control_factor:g} x stock vLLM's "
+            f"mean {common.fmt_num(ref_mean)} = {common.fmt_num(neg_control_factor * ref_floor)}: an engine as "
+            "precise as stock vLLM could have satisfied the mean rule"
+        )
     return FAILURE_UNDERPOWERED, (
-        f"only the mean rule failed and HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} <= the "
-        f"required {common.fmt_num(needed)}"
+        f"only the mean rule failed, HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} <= the "
+        f"required {common.fmt_num(needed)} and <= {neg_control_factor:g} x stock vLLM's mean "
+        f"{common.fmt_num(ref_mean)}, and the reloaded mean {common.fmt_num(reloaded_mean)} is within "
+        f"{max_noise_ratio:g} x stock vLLM's"
     )
 
 
@@ -364,22 +408,28 @@ def rerun_commands(raw_argv: list[str], args, ckpt_dir: str, tag: str) -> dict:
             "commands": commands, "hint": hint}  # fmt: skip
 
 
-def underpowered_explanation(*, stats, weights_diff, needed, distance, args, tracking, tracking_evaluable, rerun) -> str:
+def underpowered_explanation(
+    *, stats, weights_diff, needed, distance, args, tracking, tracking_evaluable, rerun, reference_mean
+) -> str:
     """The paragraph that goes into the console, the markdown and the JSON."""
     fmt = common.fmt_num
     reloaded, negative = stats["reloaded"], stats["negative_control"]
     track_1, track_2 = tracking["sample_1"], tracking["sample_2"]
     text = (
         f"The gate FAILED only because the checkpoint is too close to the base model for the "
-        f"{fmt(args.neg_control_factor)}x mean rule to have power; this is not an engine failure, and the default "
-        "verdict (FAIL, exit status 1) is unchanged. Every engine check passed: bitwise reload, parameter pointers, "
+        f"{fmt(args.neg_control_factor)}x mean rule to have power; this is consistent with a correct engine, and the "
+        "default verdict (FAIL, exit status 1) is unchanged. Every engine check passed: bitwise reload, parameter pointers, "
         "tied weights, greedy fingerprints, response contract, the reloaded / base_after_roundtrip means and their "
         "same-range rule. The only failed check is negative_control_clearly_larger: it needs engine(base) vs "
         f"HF(checkpoint) mean |delta log p| ({fmt(negative['mean'])}) to exceed {fmt(args.neg_control_factor)} x "
         f"max(reloaded mean {fmt(reloaded['mean'])}, noise floor {args.noise_floor:g}) = {fmt(needed)}, but HF(base) "
         f"and HF(checkpoint) themselves differ by only {fmt(distance)} on the same sequences "
         f"({100 * weights_diff['fraction_changed']:.3f}% of bf16 weights changed: {weights_diff['num_changed']:,} of "
-        f"{weights_diff['num_elements']:,}), so no engine, however correct, could pass it. "
+        f"{weights_diff['num_elements']:,}). Stock vLLM on the same checkpoint differs from the same trainer forward "
+        f"by mean {fmt(reference_mean)}: this engine's reloaded mean is within {args.same_range_factor:g}x of that, and "
+        f"an engine with stock vLLM's noise would need more than {fmt(args.neg_control_factor)} x that = "
+        f"{fmt(args.neg_control_factor * max(reference_mean, args.noise_floor))} >= {fmt(distance)}, so it could not "
+        "pass either. "
         f"Tracking coefficients (0 = the engine's log-probs follow the base model, 1 = they follow the checkpoint): "
         f"{fmt(track_1['beta'])} +/- {fmt(track_1['se'])} after reload 1 (checkpoint weights) and "
         f"{fmt(track_2['beta'])} +/- {fmt(track_2['se'])} after reload 2 (base weights); "
@@ -813,8 +863,9 @@ def main(argv=None) -> int:
     if not mean_rule_ok and distance <= needed:
         mean_rule_detail += (
             ". The two trainer models themselves differ by no more than the required amount: this checkpoint is too "
-            "close to the base model for the mean rule to be satisfiable by ANY engine. Use --synthetic for a "
-            "decisive mean-based control, or --neg-control tracking"
+            "close to the base model for the mean rule to be satisfiable by an engine as noisy as this one (the "
+            "stock-vLLM reference on the same checkpoint shows whether a correct engine is less noisy). Use "
+            "--synthetic for a decisive mean-based control, or --neg-control tracking"
         )
     if args.neg_control == "mean":
         checks.add("negative_control_clearly_larger", mean_rule_ok, mean_rule_detail)
@@ -838,21 +889,32 @@ def main(argv=None) -> int:
             "ckpt": ref_ckpt,
             "same_checkpoint": bool(ref_ckpt) and os.path.realpath(ref_ckpt) == os.path.realpath(ckpt_dir),
             "num_sequences": ref.get("config", {}).get("num_sequences"),
+            "max_new_tokens": ref.get("config", {}).get("max_new_tokens"),
             "stats": ref_stats,
             "mean_ratio": (reloaded["mean"] / ref_stats["mean"]) if ref_stats.get("mean") else None,
         }
 
     passed = checks.ok
     failed_checks = [item["name"] for item in checks.failed]
+    reference = None
+    if vllm_ref:
+        why = []
+        if not vllm_ref["same_checkpoint"]:
+            why.append(f"the reference was measured on {vllm_ref['ckpt']}")
+        if vllm_ref["max_new_tokens"] != args.max_new_tokens:
+            why.append(f"reference max_new_tokens {vllm_ref['max_new_tokens']} != {args.max_new_tokens}")
+        reference = {"mean": vllm_ref["stats"].get("mean"), "usable": not why, "why_unusable": "; ".join(why)}
     failure_class, failure_reason = classify_failure(
-        checks.items, neg_control_mode=args.neg_control, mean_rule_ok=mean_rule_ok, distance=distance, needed=needed
-    )
+        checks.items, neg_control_mode=args.neg_control, mean_rule_ok=mean_rule_ok, distance=distance, needed=needed,
+        reloaded_mean=reloaded["mean"], reference=reference, neg_control_factor=args.neg_control_factor,
+        noise_floor=floor, max_noise_ratio=args.same_range_factor,
+    )  # fmt: skip
     failure_explanation, rerun = None, None
     if failure_class == FAILURE_UNDERPOWERED:
         rerun = rerun_commands(raw_argv, args, ckpt_dir, tag)
         failure_explanation = underpowered_explanation(
             stats=stats, weights_diff=weights_diff, needed=needed, distance=distance, args=args, tracking=tracking,
-            tracking_evaluable=tracking_evaluable, rerun=rerun,
+            tracking_evaluable=tracking_evaluable, rerun=rerun, reference_mean=reference["mean"],
         )  # fmt: skip
     samples_out = {}
     for name, s in (("sample_1", sample_1), ("sample_2", sample_2)):
@@ -965,4 +1027,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    common.run_main(main, "[gate 3c]")

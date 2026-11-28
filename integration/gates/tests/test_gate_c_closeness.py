@@ -161,10 +161,23 @@ def test_classify_failure_rules():
     classify = gate_c_reload.classify_failure
     under, engine = gate_c_reload.FAILURE_UNDERPOWERED, gate_c_reload.FAILURE_ENGINE
     mean_rule = "negative_control_clearly_larger"
-    kw = dict(neg_control_mode="mean", mean_rule_ok=False, distance=0.001, needed=0.03)
+    inconclusive = gate_c_reload.FAILURE_INCONCLUSIVE
+    ref = {"mean": 0.01, "usable": True}
+    kw = dict(neg_control_mode="mean", mean_rule_ok=False, distance=0.001, needed=0.03, reloaded_mean=0.01, reference=ref)
 
     assert classify(_items(), **{**kw, "mean_rule_ok": True})[0] is None
     assert classify(_items([mean_rule]), **kw)[0] == under
+    # without a usable same-checkpoint stock-vLLM reference the bar is the engine's own noise: inconclusive
+    assert classify(_items([mean_rule]), **{**kw, "reference": None})[0] == inconclusive
+    assert classify(_items([mean_rule]), **{**kw, "reference": {"mean": 0.01, "usable": False}})[0] == inconclusive
+    assert classify(_items([mean_rule]), **{**kw, "reference": {"mean": float("nan"), "usable": True}})[0] == inconclusive
+    # a noisy engine raises its own bar: 0.06 vs stock vLLM 0.02, checkpoint 0.08 apart -> engine, not underpowered
+    noisy = {**kw, "reloaded_mean": 0.06, "needed": 0.18, "distance": 0.08, "reference": {"mean": 0.02, "usable": True}}
+    assert classify(_items([mean_rule]), **noisy)[0] == engine
+    # engine as precise as vLLM, but a vLLM-quality engine would have passed (0.08 > 3 x 0.02)
+    assert classify(_items([mean_rule]), **{**noisy, "reloaded_mean": 0.035, "needed": 0.105})[0] == engine
+    # both conditions hold: underpowered
+    assert classify(_items([mean_rule]), **{**noisy, "reloaded_mean": 0.03, "needed": 0.09, "distance": 0.05})[0] == under
     # the models differ by more than the rule demands: a correct engine would have passed it
     assert classify(_items([mean_rule]), **{**kw, "distance": 0.05})[0] == engine
     assert classify(_items([mean_rule]), **{**kw, "distance": float("nan")})[0] == engine
@@ -224,7 +237,7 @@ def test_close_checkpoint_is_classified_underpowered(tiny_dir, close_ckpt, promp
     ref_path = ref_dir / "gate_c_vllm_reference.json"
     ref_stats = {"count": 100, "num_nonfinite": 0, "mean": 0.01, "median": 0.005, "p99": 0.1, "max": 0.3,
                  "max_prob_ratio": 1.35}  # fmt: skip
-    ref_path.write_text(json.dumps({"pass": True, "config": {"ckpt": close_ckpt, "num_sequences": 24},
+    ref_path.write_text(json.dumps({"pass": True, "config": {"ckpt": close_ckpt, "num_sequences": 24, "max_new_tokens": 40},
                                     "stats": {"engine_vs_trainer": ref_stats}}))  # fmt: skip
     tag = "close_step25"
     argv = _gate_argv(tiny_dir, close_ckpt, prompts_file, tmp_path, tag, "--vllm-reference", str(ref_path))
@@ -240,7 +253,8 @@ def test_close_checkpoint_is_classified_underpowered(tiny_dir, close_ckpt, promp
     assert result["checkpoint_vs_base"]["num_changed"] == NUM_MOVED
 
     text = result["failure_explanation"]
-    assert "too close to the base model" in text and "not an engine failure" in text
+    assert "too close to the base model" in text and "consistent with a correct engine" in text
+    assert "not an engine failure" not in text and "however correct" not in text
     assert common.fmt_num(distance) in text and common.fmt_num(needed) in text
     assert "Tracking coefficients" in text and common.fmt_num(result["tracking"]["sample_1"]["se"]) in text
     # what the tracking coefficients say is in the paragraph either way (with four bf16 steps in the last
@@ -308,13 +322,58 @@ def test_synthetic_checkpoint_still_passes(tiny_dir, synthetic_dir, prompts_file
 def test_underpowered_explanation_without_a_step_number():
     """A checkpoint path without global_step_<N> gets the generic hint instead of a command."""
     stats = {"reloaded": {"mean": 0.008}, "negative_control": {"mean": 0.009}}
-    args = types.SimpleNamespace(neg_control_factor=3.0, noise_floor=1e-4, tracking_max_se=0.1)
+    args = types.SimpleNamespace(neg_control_factor=3.0, noise_floor=1e-4, tracking_max_se=0.1, same_range_factor=2.0)
     tracking = {"sample_1": {"beta": 0.97, "se": 0.04}, "sample_2": {"beta": 0.02, "se": 0.05}}
     diff = {"fraction_changed": 0.001, "num_changed": 10, "num_elements": 10_000}
     rerun = {"next_step": None, "commands": [], "hint": gate_c_reload.GENERIC_RERUN_HINT}
     text = gate_c_reload.underpowered_explanation(
         stats=stats, weights_diff=diff, needed=0.024, distance=0.002, args=args, tracking=tracking,
-        tracking_evaluable=True, rerun=rerun,
+        tracking_evaluable=True, rerun=rerun, reference_mean=0.007,
     )  # fmt: skip
     assert gate_c_reload.GENERIC_RERUN_HINT in text and "were part of the verdict and passed" in text
     assert "0.97 +/- 0.04" in text and "0.024" in text and "0.002" in text
+
+
+class _NoisyLogprobEngine:
+    """A ReferenceEngine whose sampled-token log-probs carry extra noise (reload itself is correct)."""
+
+    def __init__(self, inner, scale):
+        import numpy as np
+
+        self._inner, self._scale, self._rng = inner, scale, np.random.default_rng(123)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def generate(self, *args, **kwargs):
+        result = self._inner.generate(*args, **kwargs)
+        if kwargs.get("temperature", 1.0) > 0 and result.logprobs is not None:
+            result.logprobs = [[min(0.0, x + float(self._rng.laplace(0.0, self._scale))) for x in row]
+                               for row in result.logprobs]  # fmt: skip
+        return result
+
+
+def test_noisy_engine_is_not_blamed_on_the_checkpoint(tiny_dir, prompts_file, tmp_path, monkeypatch):
+    """A checkpoint a correct engine passes on; the same engine with 3x noisier log-probs (still far below
+    --max-mean-abs-dlogp) fails only the mean rule, and must NOT be called underpowered."""
+    ckpt = tmp_path / "run" / "hf" / "global_step_25"
+    synth.make_synthetic_checkpoint(tiny_dir, str(ckpt), rel_noise=0.001, seed=0)
+    argv = lambda tag, *extra: _gate_argv(tiny_dir, str(ckpt), prompts_file, tmp_path, tag, "--num-prompts", "16",
+                                          "--n", "8", "--max-new-tokens", "64", *extra)  # fmt: skip
+    status, correct = _run_gate(argv("correct"), tmp_path, "correct")
+    assert status == 0 and correct["pass"] is True, correct["failed_checks"]
+
+    ref_path = tmp_path / "ref.json"
+    ref_stats = {"count": 1000, "num_nonfinite": 0, "mean": correct["stats"]["reloaded"]["mean"], "median": 0.0,
+                 "p99": 0.0, "max": 0.0, "max_prob_ratio": 1.0}  # fmt: skip
+    ref_path.write_text(json.dumps({"pass": True, "config": {"ckpt": str(ckpt), "max_new_tokens": 64},
+                                    "stats": {"engine_vs_trainer": ref_stats}}))  # fmt: skip
+    real_build = common.build_engine
+    monkeypatch.setattr(common, "build_engine", lambda kind, path, **o: _NoisyLogprobEngine(real_build(kind, path, **o), 0.02))
+    for tag, extra, want in (("noisy_ref", ("--vllm-reference", str(ref_path)), gate_c_reload.FAILURE_ENGINE),
+                             ("noisy_noref", (), gate_c_reload.FAILURE_INCONCLUSIVE)):  # fmt: skip
+        status, result = _run_gate(argv(tag, *extra), tmp_path, tag)
+        assert status == 1 and result["failed_checks"] == ["negative_control_clearly_larger"], result["failed_checks"]
+        assert result["stats"]["reloaded"]["mean"] < 0.1  # passes the absolute cap: only the mean rule catches it
+        assert result["failure_class"] == want, (tag, result["failure_reason"])
+        assert result["failure_explanation"] is None

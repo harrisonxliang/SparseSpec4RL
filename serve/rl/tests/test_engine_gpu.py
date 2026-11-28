@@ -33,10 +33,13 @@ Environment variables
     SPARSESPEC_TEST_ADMISSION        engine admission: worst_case (default) | host_guard
     SPARSESPEC_TEST_OFFLOAD_STRESS   1 = offload stress process (see 3 above; default 0)
   only read with SPARSESPEC_TEST_OFFLOAD_STRESS=1:
-    SPARSESPEC_TEST_KV_CAPACITY_TOKENS        GPU KV pool size (default 4096 tokens: with the defaults
-                                              below about 6 to 8 requests in flight need ~6-7.5k tokens)
+    SPARSESPEC_TEST_KV_CAPACITY_TOKENS        GPU KV pool size (default 8192 tokens: with the defaults
+                                              below 7 (worst_case) or 9 (host_guard) requests in flight
+                                              need ~13.7-17.6k tokens)
     SPARSESPEC_TEST_STRESS_NUM_REQUESTS       requests in the stress batch (default 24)
-    SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS     response length of every stress request (default 512)
+    SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS     response length of every stress request (default 1536: ~1.95k KV
+                                              tokens per request, so offload victims often hold more than one
+                                              Request.MAX_OFFLOADING_LEN = 1024-token step, as in training)
     SPARSESPEC_TEST_STRESS_MAX_RESPONSE_DLOGP bound on the worst single response's mean |delta log p|
                                               (default 3 x SPARSESPEC_TEST_MAX_MEAN_DLOGP)
 
@@ -99,9 +102,9 @@ ADMISSION = os.environ.get("SPARSESPEC_TEST_ADMISSION", "worst_case")
 if ADMISSION not in memory.ADMISSION_MODES:
     raise ValueError(f"SPARSESPEC_TEST_ADMISSION={ADMISSION!r}: expected one of {memory.ADMISSION_MODES}")
 OFFLOAD_STRESS = os.environ.get("SPARSESPEC_TEST_OFFLOAD_STRESS", "0") not in ("", "0")
-KV_CAPACITY_TOKENS = _env("SPARSESPEC_TEST_KV_CAPACITY_TOKENS", "4096", int)
+KV_CAPACITY_TOKENS = _env("SPARSESPEC_TEST_KV_CAPACITY_TOKENS", "8192", int)
 STRESS_NUM_REQUESTS = _env("SPARSESPEC_TEST_STRESS_NUM_REQUESTS", "24", int)
-STRESS_MAX_NEW_TOKENS = _env("SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS", "512", int)
+STRESS_MAX_NEW_TOKENS = _env("SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS", "1536", int)
 STRESS_MAX_RESPONSE_DLOGP = _env("SPARSESPEC_TEST_STRESS_MAX_RESPONSE_DLOGP", str(3 * MAX_MEAN_DLOGP), float)
 
 # tests that run in the offload-stress process (SPARSESPEC_TEST_OFFLOAD_STRESS=1); all others are skipped there
@@ -709,7 +712,7 @@ def _per_response_mean_dlogp(a, b) -> list[float]:
     return out
 
 
-def test_offload_stress(engine, hf_model, prompts, eos):
+def test_offload_stress(engine, hf_model, prompts, eos, monkeypatch):
     """More fixed-length requests than the GPU KV pool holds: the scheduler must offload KV to the
     host pool and restore it, and that must not corrupt anything.
 
@@ -724,6 +727,9 @@ def test_offload_stress(engine, hf_model, prompts, eos):
     3. all at once, greedy: offloads happen; outputs equal the reference (or differ only at a bf16
        near-tie of HF's logits: batch composition changes the bf16 arithmetic);
     4. the first reference chunk again: bitwise identical (nothing stale after offloading);
+    5. steps 2 and 3 left some request partly on the GPU and partly on the host, both ways: an offload
+       and a restore call each moved only Request.MAX_OFFLOADING_LEN tokens and the rest followed in a
+       later call (the multi-step path long training responses take), so 2 and 3 covered it;
     the KV pools are clean after every call."""
     pool = engine.kv_pool
     kv = pool.capacity
@@ -778,6 +784,27 @@ def test_offload_stress(engine, hf_model, prompts, eos):
         if first_chunk is None:
             first_chunk = (part, [list(t) for t in result.token_ids])
 
+    # count the offload / restore calls of steps 2 and 3 that leave a request split between the pools
+    from serve.request.request import Request
+
+    moves = {"offload_calls": 0, "partial_offloads": 0, "restore_calls": 0, "partial_restores": 0}
+    real_offload, real_restore = Request.offload, Request.restore
+
+    def counting_offload(self):
+        out = real_offload(self)  # self while GPU pages remain: the scheduler offloads the rest later
+        moves["offload_calls"] += 1
+        moves["partial_offloads"] += out is not None
+        return out
+
+    def counting_restore(self):
+        out = real_restore(self)  # self while host pages remain: the scheduler restores the rest later
+        moves["restore_calls"] += 1
+        moves["partial_restores"] += out is not None
+        return out
+
+    monkeypatch.setattr(Request, "offload", counting_offload)
+    monkeypatch.setattr(Request, "restore", counting_restore)
+
     # 2. everything at once at T=1: offloads, and the log-probs still match the trainer forward
     sampled = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=1.0, eos_token_ids=never)
     stats = sampled.stats
@@ -828,6 +855,9 @@ def test_offload_stress(engine, hf_model, prompts, eos):
         f"(> {TIE_MARGIN} logits): (request, status, first diff, margin) = {bad}"
     )
 
+    multi_step = dict(moves)  # steps 2 and 3 only
+    print(f"[stress] offload / restore calls of the two stress runs: {multi_step}")
+
     # 4. nothing stale: the first reference chunk again, bitwise
     part, want = first_chunk
     again = engine.generate(part, max_new_tokens=max_new_tokens, temperature=0.0, eos_token_ids=never)
@@ -835,3 +865,12 @@ def test_offload_stress(engine, hf_model, prompts, eos):
     assert [list(t) for t in again.token_ids] == want, "after the offload runs the same small greedy batch changed"
     _assert_pool_clean(engine, "at the end of the stress test")
     _assert_torch_defaults_untouched()
+
+    # 5. coverage, checked last so every correctness check above has run: steps 2 and 3 really took the
+    #    multi-step path (a request partly on the GPU, partly on the host)
+    assert multi_step["partial_offloads"] > 0 and multi_step["partial_restores"] > 0, (
+        f"the stress runs never moved a request in more than one {Request.MAX_OFFLOADING_LEN}-token step each way "
+        f"({multi_step}): the multi-step offload / restore path training uses was not exercised. Raise "
+        "SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS (offload victims must hold more than "
+        f"{Request.MAX_OFFLOADING_LEN} KV tokens)"
+    )

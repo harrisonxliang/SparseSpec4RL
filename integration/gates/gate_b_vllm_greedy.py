@@ -395,4 +395,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    common.run_main(main, "[gate 3b vllm]")

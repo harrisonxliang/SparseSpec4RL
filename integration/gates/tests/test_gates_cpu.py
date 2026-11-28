@@ -785,7 +785,7 @@ def test_gate_c_negative_control_when_the_checkpoint_is_close_to_the_base_model(
     status, result = _gate_c(tiny_dir, str(close), prompts_file, tmp_path, "close_mean", *factor)
     assert status == 1 and _failed(result) == {"negative_control_clearly_larger"}
     detail = next(c["detail"] for c in result["checks"] if c["name"] == "negative_control_clearly_larger")
-    assert "satisfiable by ANY engine" in detail and "--neg-control tracking" in detail
+    assert "satisfiable by an engine as noisy as this one" in detail and "--neg-control tracking" in detail
     assert result["tracking"]["sample_1"]["beta"] > 0.8 and result["tracking"]["sample_2"]["beta"] < 0.2
 
     status, result = _gate_c(tiny_dir, str(close), prompts_file, tmp_path, "close_tracking", *factor, "--neg-control", "tracking")
@@ -1033,3 +1033,37 @@ def test_gate_modules_do_not_import_gpu_only_packages(tiny_dir):
     assert "IMPORTED:\n" in run.stdout + "\n", run.stdout
     with pytest.raises(ValueError):
         common.build_engine("vllm", tiny_dir)
+
+
+def test_run_main_exit_status_contract(capsys):
+    """0 PASS / 1 FAIL pass through; an unexpected exception is a crash (exit 3, traceback printed), not
+    CPython's exit 1, which the gate runner would read as a FAIL verdict; SystemExit passes through."""
+    for status in (0, 1, 2):
+        with pytest.raises(SystemExit) as info:
+            common.run_main(lambda status=status: status, "[gate x]")
+        assert info.value.code == status
+
+    def boom():
+        raise RuntimeError("CUDA out of memory (simulated)")
+
+    with pytest.raises(SystemExit) as info:
+        common.run_main(boom, "[gate x]")
+    assert info.value.code == common.EXIT_CRASH == 3
+    captured = capsys.readouterr()
+    assert "[gate x] CRASHED: unexpected RuntimeError" in captured.out
+    assert captured.err.rstrip().endswith("RuntimeError: CUDA out of memory (simulated)")
+
+    def refuse():
+        raise SystemExit("FAIL: checkpoint not found")
+
+    with pytest.raises(SystemExit) as info:
+        common.run_main(refuse, "[gate x]")
+    assert info.value.code == "FAIL: checkpoint not found"
+
+
+@pytest.mark.parametrize(
+    "script", ["gate_b_greedy", "gate_b_vllm_greedy", "gate_c_reload", "gate_c_vllm_reference", "gate_d_smoke_check"]
+)
+def test_every_gate_reports_a_crash_with_exit_status_3(script):
+    source = (REPO_ROOT / "integration" / "gates" / f"{script}.py").read_text()
+    assert "common.run_main(main, " in source and "sys.exit(main())" not in source

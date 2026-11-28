@@ -1059,6 +1059,13 @@ def full_run(args) -> int:
         check_sides_match(ours, vllm_side, label=f"vLLM file {args.vllm_json}", allow_model_mismatch=args.allow_model_mismatch)
         common.log(f"[gate 3b] vLLM file {args.vllm_json}: same prompts, settings and model ({vllm_side.get('engine')})")
 
+    # a crash below must not leave an earlier run's token files under this tag (--compare-only would grade them)
+    engine_path, hf_path = _side_paths(args, tag)
+    for stale in (engine_path, hf_path):
+        if os.path.exists(stale):
+            os.remove(stale)
+            common.log(f"[gate 3b] removed the previous run's {stale}")
+
     # ---- engine: all prompts in one call, temperature 0 ----
     common.log(f"[gate 3b] building the {args.engine} engine from {model_dir} on {args.device}")
     engine = common.build_engine(args.engine, model_dir, **common.engine_opts_from_args(args))
@@ -1074,7 +1081,6 @@ def full_run(args) -> int:
         eos_token_ids=eos, logprobs=[list(map(float, lp)) for lp in result.logprobs],
         engine_options=common.engine_opts_from_args(args), engine_stats=engine_stats, seconds=engine_seconds,
     )  # fmt: skip
-    engine_path, hf_path = _side_paths(args, tag)
     common.write_json(engine_path, engine_side)
     common.log(f"[gate 3b] wrote {engine_path}")
     engine.sleep()  # release the rollout-only GPU memory before the HF model runs
@@ -1293,4 +1299,4 @@ def compare_only(args) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    common.run_main(main, "[gate 3b]")

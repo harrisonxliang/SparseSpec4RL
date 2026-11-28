@@ -22,10 +22,10 @@ Output files (under --out-dir, default baseline/results/sparsespec_checks/):
                         gate_c_reload --vllm-reference
   <NAME>.md             phase 'score'
 e.g. --tag step50 -> gate_c_vllm_reference_step50.json. Exit status: 0 PASS, 1 FAIL
-(non-finite or missing log-probs, or the sampling child failed: then no <NAME>.json
-is written), 128 + N if the child was killed by signal N; unusable inputs (a samples
-file from another checkpoint, mismatched lengths) stop with an error message and
-status 1. Phases 'all' and 'score' end with a line starting "[gate 3c vllm reference]"
+(non-finite or missing log-probs), 3 an unexpected exception here or in the sampling
+child (crash: no <NAME>.json is written), 128 + N if the child was killed by signal N;
+unusable inputs (a samples file from another checkpoint, mismatched lengths) stop with
+an error message and status 1. Phases 'all' and 'score' end with a line starting "[gate 3c vllm reference]"
 that contains PASS or FAIL.
 
 Phases
@@ -328,4 +328,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    common.run_main(main, "[gate 3c vllm reference]")

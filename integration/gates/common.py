@@ -74,6 +74,31 @@ def log(msg: str = "") -> None:
     print(msg, flush=True)
 
 
+# Exit status contract of every gate: 0 PASS, 1 FAIL, anything else = no verdict.
+# 2 is argparse's usage error and gate 3b's REFUSED (inputs do not match).
+EXIT_CRASH = 3
+
+
+def run_main(main, prefix: str) -> None:
+    """``sys.exit(main())`` for a gate's ``__main__`` block, except that an
+    unexpected exception (CUDA OOM, an upstream AssertionError, an ImportError)
+    exits with EXIT_CRASH after its traceback instead of CPython's 1, which the
+    gate runner would read as a FAIL verdict. ``SystemExit`` (argparse errors,
+    the gates' own "FAIL: ..." messages) and ``KeyboardInterrupt`` pass through."""
+    try:
+        status = main()
+    except Exception as exc:  # noqa: BLE001 - reported as a crash, never swallowed
+        # before the traceback, so that the traceback's last line stays the last error line of the log
+        log(f"{prefix} CRASHED: unexpected {type(exc).__name__}; no verdict was computed "
+            f"(exit status {EXIT_CRASH}); traceback below")  # fmt: skip
+        import traceback
+
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.exit(EXIT_CRASH)
+    sys.exit(status)
+
+
 # ----------------------------------------------------------------------------
 # prompts
 # ----------------------------------------------------------------------------
