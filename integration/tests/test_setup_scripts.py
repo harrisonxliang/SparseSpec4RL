@@ -151,12 +151,51 @@ def write_dist(version, editable=None):
             fh.write(editable + "\n")
 
 
+def user_install():
+    """Like real pip: a `user = true` config (FAKE_PIP_USER_CONFIG) is overridden by PIP_USER=0;
+    FAKE_PIP_FORCE_USER stands for any other reason pip would pick the user site."""
+    if os.environ.get("FAKE_PIP_FORCE_USER"):
+        return True
+    return bool(os.environ.get("FAKE_PIP_USER_CONFIG")) and os.environ.get("PIP_USER", "") not in ("0", "false", "no", "off")
+
+
+def user_site():
+    return os.path.join(os.environ["HOME"], ".local", "lib", f"python{sys.version_info[0]}.{sys.version_info[1]}", "site-packages")
+
+
 args = sys.argv[1:]
 log("pip " + " ".join(args))
+if args[:1] == ["install"]:
+    log("pipenv PIP_USER=" + os.environ.get("PIP_USER", "<unset>"))
 if args[:1] == ["--version"]:
     print(f"pip 24.0 from {SITE}/pip (python {sys.version_info[0]}.{sys.version_info[1]})")
     sys.exit(0)
+if args[:2] == ["config", "list"]:
+    if os.environ.get("FAKE_PIP_USER_CONFIG"):
+        print("global.user='true'")
+    sys.exit(0)
+if args[:1] == ["install"] and os.environ.get("FAKE_PIP_REQUIRE_VENV") and \
+        os.environ.get("PIP_REQUIRE_VIRTUALENV", "") not in ("0", "false", "no", "off"):
+    # like real pip with `require-virtualenv = true` in a config file: a conda env is no virtualenv
+    print("ERROR: Could not find an activated virtualenv (required).", file=sys.stderr)
+    sys.exit(3)
+if args[:1] == ["install"] and os.environ.get("PIP_TARGET"):  # real pip reads PIP_TARGET as --target
+    SITE = os.environ["PIP_TARGET"]
+    if "--root" not in args:
+        os.makedirs(SITE, exist_ok=True)
+if args[:1] == ["install"] and "--root" in args:  # setup_env.sh's pip_target probe: a local wheel
+    import zipfile
+
+    root = args[args.index("--root") + 1]
+    dest = os.path.join(root, (user_site() if user_install() else SITE).lstrip("/"))
+    with zipfile.ZipFile(args[-1]) as z:
+        z.extractall(dest)
+    print("Successfully installed " + os.path.basename(args[-1]))
+    sys.exit(0)
 if args[:1] == ["install"]:
+    if user_install():  # where real pip would put it: the user site, shared by every env
+        SITE = user_site()
+        os.makedirs(SITE, exist_ok=True)
     if os.environ.get("FAKE_PIP_FAIL"):
         print("ERROR: Could not build editable verl (fake pip: injected failure)", file=sys.stderr)
         sys.exit(1)
@@ -461,8 +500,9 @@ class Sandbox:
 
 
 def changing_calls(calls: list[str]) -> list[str]:
-    """Calls that change something (an env, a checkout or an install)."""
-    pattern = re.compile(r"^(conda (create|remove|env remove)|git clone|pip install)")
+    """Calls that change something (an env, a checkout or an install). The pip_target probe
+    (`pip install ... --root <tmp> <wheel>`) writes only into a temp dir and is not one."""
+    pattern = re.compile(r"^(conda (create|remove|env remove)|git clone|pip install(?!.* --root ))")
     return [c for c in calls if pattern.match(c)]
 
 
@@ -660,6 +700,8 @@ def _prepare_precondition(box: Sandbox, case: str) -> dict:
     if case == "wrong_verl":
         box.make_env(DEFAULT_ENV, verl_version="0.4.1")
         return {}
+    if case == "pip_user_target":
+        return {"FAKE_PIP_FORCE_USER": "1"}
     if case == "checkout_dir_not_writable":
         ro = box.tmp / "readonly"
         ro.mkdir()
@@ -716,6 +758,7 @@ PRECONDITIONS = {
                        f"fix: conda run -n {DEFAULT_ENV} python -m pip install --no-deps verl==0.5.0"],
     "wrong_verl": [f"'{DEFAULT_ENV}' has verl 0.4.1, not 0.5.0", f"conda run -n {DEFAULT_ENV} python -m pip install --no-deps verl==0.5.0"],
     "checkout_dir_not_writable": ["no write access to", "where the checkout", "set VERL_SRC=<a writable dir>"],
+    "pip_user_target": ["would install into", "/.local/lib/", "outside the env", "pip config list"],
     "half_made_checkout": ["contains no verl/ package: not a finished verl checkout", "rm -rf"],
     "checkout_missing_file": ["has changes besides the two patched files", "verl/protocol.py"],
     "checkout_edited": ["the patch neither applies to nor is already applied in", "sha256", "(pristine verl 0.5.0 wheel: "],
@@ -784,6 +827,64 @@ def test_failures_during_the_run_leave_a_state_the_next_run_completes(sandbox):
     assert_setup_ok(sandbox, r5)
     assert "already patched (an earlier run got this far)" in r5.out
     assert [c.split()[0:2] for c in changing_calls(r5.calls)] == [["pip", "install"]]
+
+
+def test_pip_user_config_is_overridden_and_the_install_target_checked(sandbox):
+    """A pip config `user = true` would send the patched verl into ~/.local (which verl-baseline
+    imports too); the script exports PIP_USER=0 for every pip call and checks pip's real target."""
+    text = (REPO_ROOT / SETUP).read_text()
+    assert re.search(r"^export PIP_USER=0\b", text, flags=re.M)
+    assert not re.search(r"^[^#]*PYTHONNOUSERSITE", text, flags=re.M), "PYTHONNOUSERSITE must not be set"
+    result = sandbox.run(SETUP, FAKE_PIP_USER_CONFIG="1")
+    assert_setup_ok(sandbox, result)
+    installs = [c for c in result.calls if c.startswith("pipenv ")]
+    assert len(installs) >= 2 and set(installs) == {"pipenv PIP_USER=0"}, result.calls  # probe(s) + the install
+    assert "installs into its own prefix" in result.out and "pip installs into " in result.out
+    assert not (sandbox.home / ".local").exists()
+    # the same config without the export: what the fake pip (like real pip) would have done
+    env = sandbox.environ(FAKE_PIP_USER_CONFIG="1")
+    probe = subprocess.run(
+        [str(sandbox.env_dir(DEFAULT_ENV) / "bin" / "python"), "-m", "pip", "install", "--no-deps", "-e", str(sandbox.verl_src)],
+        env=env, capture_output=True, text=True,
+    )  # fmt: skip
+    assert probe.returncode == 0 and (sandbox.home / ".local").exists(), probe.stdout + probe.stderr
+
+
+def test_require_virtualenv_config_and_caller_pip_target_do_not_reach_pip(sandbox):
+    """A pip config `require-virtualenv = true` would refuse every install into a conda env, and a
+    PIP_TARGET / PIP_PREFIX exported by the caller would redirect the install (pip reads them as
+    --target / --prefix): the script exports PIP_REQUIRE_VIRTUALENV=0 and unsets the other two."""
+    text = (REPO_ROOT / SETUP).read_text()
+    assert re.search(r"^export PIP_USER=0 PIP_REQUIRE_VIRTUALENV=0$", text, flags=re.M)
+    assert re.search(r"^unset PIP_TARGET PIP_PREFIX$", text, flags=re.M)
+    assert not re.search(r"^\s*PIP_TARGET=", text, flags=re.M), "the script's own variable must not be pip's PIP_TARGET"
+    elsewhere = sandbox.tmp / "elsewhere"
+    result = sandbox.run(SETUP, FAKE_PIP_REQUIRE_VENV="1", PIP_REQUIRE_VIRTUALENV="1",
+                         PIP_TARGET=elsewhere, PIP_PREFIX=elsewhere)  # fmt: skip
+    assert_setup_ok(sandbox, result)
+    assert "unsetting PIP_TARGET/PIP_PREFIX" in result.out
+    assert "installs into its own prefix" in result.out and not elsewhere.exists()
+    # negative controls: the fake pip, like real pip, honours both without the script
+    py = str(sandbox.env_dir(DEFAULT_ENV) / "bin" / "python")
+    cmd = [py, "-m", "pip", "install", "--no-deps", "-e", str(sandbox.verl_src)]
+    refused = subprocess.run(cmd, env=sandbox.environ(FAKE_PIP_REQUIRE_VENV="1"), capture_output=True, text=True)
+    assert refused.returncode == 3 and "activated virtualenv" in refused.stderr
+    redirected = subprocess.run(cmd, env=sandbox.environ(PIP_TARGET=elsewhere), capture_output=True, text=True)
+    assert redirected.returncode == 0 and elsewhere.exists(), redirected.stdout + redirected.stderr
+
+
+def test_stale_partial_clone_is_removed_whatever_the_checkout_state(sandbox):
+    assert_setup_ok(sandbox, sandbox.run(SETUP))
+    partial = Path(str(sandbox.verl_src) + ".partial")
+    partial.mkdir()
+    (partial / "junk").write_text("x")
+    second = sandbox.run(SETUP)
+    assert_setup_ok(sandbox, second)
+    assert "will remove the leftover" in second.out and f"removing {partial}" in second.out
+    assert not partial.exists()
+    third = sandbox.run(SETUP)
+    assert_setup_ok(sandbox, third)
+    assert "leftover" not in third.out and "left over" not in third.out
 
 
 def test_tripwire_fires_if_the_baseline_changes(sandbox):

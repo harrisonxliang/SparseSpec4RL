@@ -103,6 +103,18 @@ ss_init setup_env
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/setup_env.XXXXXX")
 export GIT_TERMINAL_PROMPT=0   # git must fail, not wait for a password nobody types
+# pip config `user = true` (or PIP_USER=1, or an unwritable site-packages) would install the patched
+# verl into ~/.local, which verl-baseline also imports. The variable overrides every pip config file.
+# PYTHONNOUSERSITE is deliberately not set: it does not stop user installs and would hide the user
+# site from the checks below while the training runs still import from it.
+# PIP_REQUIRE_VIRTUALENV=0: a conda env is not a virtualenv, so a pip config with
+# `require-virtualenv = true` would refuse the install; where pip writes is checked below.
+# PIP_TARGET / PIP_PREFIX (pip's --target / --prefix) would redirect the install: unset.
+if [ -n "${PIP_TARGET:-}" ] || [ -n "${PIP_PREFIX:-}" ]; then
+    ss_log "unsetting PIP_TARGET/PIP_PREFIX of the calling shell"
+fi
+unset PIP_TARGET PIP_PREFIX
+export PIP_USER=0 PIP_REQUIRE_VIRTUALENV=0
 FINAL_DONE=0
 RERUN_NOTE="nothing has been changed yet"
 CREATED_ENV=0          # 1 while an env this run is creating may be half made
@@ -279,6 +291,59 @@ listing = hashlib.sha256("\n".join(entries).encode()).hexdigest()
 combined = hashlib.sha256((files.hexdigest() + listing).encode()).hexdigest()
 print(combined, files.hexdigest(), count, pkg, len(entries), site)
 EOF
+# where `python -m pip install` of a given interpreter really writes: a throwaway 2-file wheel is
+# installed with --root into a temp dir (nothing is written to the env); exit 2 = outside sys.prefix
+cat >"$TMP_DIR/pip_target.py" <<'EOF'
+import atexit
+import base64
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+NAME = "ss_pip_target_probe"
+prefix = os.path.realpath(sys.prefix)
+print("sys_prefix=" + prefix)
+tmp = tempfile.mkdtemp(prefix="ss_pip_target.")
+atexit.register(shutil.rmtree, tmp, True)  # the probe leaves nothing behind
+files = {NAME + "/__init__.py": b"",
+         NAME + "-0.dist-info/METADATA": ("Metadata-Version: 2.1\nName: %s\nVersion: 0\n" % NAME).encode(),
+         NAME + "-0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: ss\nRoot-Is-Purelib: true\nTag: py3-none-any\n"}
+rec = ["%s,sha256=%s,%d" % (k, base64.urlsafe_b64encode(hashlib.sha256(v).digest()).rstrip(b"=").decode(), len(v))
+       for k, v in files.items()] + [NAME + "-0.dist-info/RECORD,,"]
+files[NAME + "-0.dist-info/RECORD"] = ("\n".join(rec) + "\n").encode()
+whl = os.path.join(tmp, NAME + "-0-py3-none-any.whl")
+with zipfile.ZipFile(whl, "w") as z:
+    for k, v in files.items():
+        z.writestr(k, v)
+root = os.path.join(tmp, "root")
+r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--no-compile",
+                    "--no-warn-script-location", "--root", root, whl], capture_output=True, text=True)
+found = ""
+for d, _, names in os.walk(root):
+    if os.path.basename(d) == NAME and "__init__.py" in names:
+        found = "/" + os.path.relpath(os.path.dirname(d), root)
+        break
+if r.returncode != 0 or not found:
+    for line in (r.stdout + r.stderr).strip().splitlines()[-8:]:
+        print("pip| " + line)
+    print("target=")
+    sys.exit(1)
+target = os.path.realpath(found) if os.path.isdir(found) else found
+print("target=" + target)
+sys.exit(0 if (target + os.sep).startswith(prefix + os.sep) else 2)
+EOF
+SS_PIP_TARGET=""
+pip_target() {  # pip_target <python>: 0 = pip writes inside that python's prefix; sets SS_PIP_TARGET, output in $TMP_DIR/pip_target.out
+    local rc=0
+    env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 "$1" -B "$TMP_DIR/pip_target.py" >"$TMP_DIR/pip_target.out" 2>&1 || rc=$?
+    SS_PIP_TARGET=$(sed -n 's/^target=//p' "$TMP_DIR/pip_target.out")
+    return "$rc"
+}
+
 BASELINE_HASH=""
 BASELINE_HASH_WHAT=""
 hash_baseline() {  # sets BASELINE_HASH (combined digest) and BASELINE_HASH_WHAT (what was hashed)
@@ -649,6 +714,20 @@ else
     if [ -n "${PROBE_PY:-}" ] && [ "${P_OK:-0}" = 1 ]; then
         if PIP_VERSION=$(env -u PYTHONPATH -u PYTHONHOME "$PROBE_PY" -B -m pip --version 2>"$TMP_DIR/pip.err"); then
             ok "pip in $PROBE_WHO: $PIP_VERSION"
+            # the clone has the same pip and the same pip config as the base, so the base answers for it
+            if pip_target "$PROBE_PY"; then
+                ok "pip in $PROBE_WHO installs into its own prefix: $SS_PIP_TARGET (PIP_USER=0)"
+            else
+                rc=$?
+                if [ "$rc" = 2 ]; then
+                    fail "pip in $PROBE_WHO would install into $SS_PIP_TARGET, outside the env (a pip 'user' setting or an unwritable site-packages): verl-baseline imports that user site too" \
+                        "check: $PROBE_PY -m pip config list; make sure nothing in this shell sets PIP_USER after the script exports PIP_USER=0, and that $(id -un) can write to the env"
+                else
+                    fail "a throwaway 'pip install --no-index --root <tmp>' of a local wheel fails in $PROBE_WHO, so the install of verl would fail too:" \
+                        "fix what pip reports below, then re-run"
+                fi
+                indent <"$TMP_DIR/pip_target.out"
+            fi
         else
             fail "'python -m pip' does not work in $PROBE_WHO:" \
                 "conda install -y -n $ENV_NAME pip   (after the clone, if the env does not exist yet; never in $BASE_ENV)"
@@ -842,12 +921,13 @@ if [ "$VERL_IN_PLACE" = 1 ]; then
     EXPECT_VERL_DIR="$P_VERL_DIR"
     RERUN_NOTE="'$ENV_NAME' has the patched verl in place; a re-run skips the patch"
 else
+    # whatever the checkout state (the plan promises it): a leftover of an interrupted clone is never used
+    if [ -e "$VERL_PARTIAL" ]; then
+        ss_log "removing $VERL_PARTIAL (left over from an interrupted clone)"
+        rm -rf "$VERL_PARTIAL"
+    fi
     if [ "$CHECKOUT_STATE" = missing ] || [ "$CHECKOUT_STATE" = empty ]; then
         ss_step "clone verl $VERL_TAG into $VERL_SRC"
-        if [ -e "$VERL_PARTIAL" ]; then
-            ss_log "removing $VERL_PARTIAL (left over from an interrupted clone)"
-            rm -rf "$VERL_PARTIAL"
-        fi
         RERUN_NOTE="the clone into $VERL_PARTIAL failed; a re-run removes it and clones again"
         if ! ss_run git clone --depth 1 --branch "$VERL_TAG" "$VERL_GIT_URL" "$VERL_PARTIAL"; then
             rm -rf "$VERL_PARTIAL"
@@ -889,6 +969,11 @@ else
     if [ "$P_VERL_DIR" = "$(realdir "$VERL_SRC")/verl" ] && [ "$P_VERL_VERSION" = "$VERL_VERSION" ]; then
         ss_log "'$ENV_NAME' already imports verl $P_VERL_VERSION from $VERL_SRC/verl; nothing to install"
     else
+        if ! pip_target "$PYTHON"; then
+            indent <"$TMP_DIR/pip_target.out"
+            ss_die "pip in '$ENV_NAME' would not install into $CONDA_PREFIX (target: ${SS_PIP_TARGET:-pip failed, output above}); nothing was installed"
+        fi
+        ss_log "pip installs into $SS_PIP_TARGET (inside $CONDA_PREFIX)"
         ss_log "'$ENV_NAME' now has verl $P_VERL_VERSION at $P_VERL_DIR; installing $VERL_SRC editable over it"
         # No `pip uninstall` first: pip builds the editable wheel before it removes the installed verl
         # and rolls the removal back if the install fails, so a failed build leaves the env as it was.

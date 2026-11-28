@@ -11,7 +11,9 @@
 #   - RAFT headers and rmm (librmm.so) built from 3rdparty/raft into the env prefix
 #     (README "install raft header-only lib"; serve/attention/backend.py looks for them under
 #     $CONDA_PREFIX/include and $CONDA_PREFIX/lib),
-#   - this repo, `pip install --no-deps -e .` (why --no-deps: see step "install the repo").
+#   - this repo, `pip install --no-deps -e .` (why --no-deps: see step "install the repo"),
+#   - pytest (+ iniconfig, pluggy, and only what `import pytest` still misses; --no-deps) if the
+#     clone has none: integration/run_all_gates.sh runs the CPU and GPU test stages with it.
 # NOT the vLLM fork (3rdparty/vllm): serve/ only imports vllm._custom_ops
 # (serve/distribute/custom_all_reduce.py), which stock vLLM 0.9.1 has, and the fork pins torch 2.8.0,
 # which would make the training path's torch differ between the two arms.
@@ -80,18 +82,29 @@ CPM_CACHE_DIR="$BUILD_DIR/cpm-cache"     # rapids-cmake / CPM downloads survive 
 # The six packages whose versions must be identical in both arms (training path).
 CRITICAL_PKGS="torch transformers verl vllm numpy tensordict"
 # Packages this script itself may add or change in the clone (everything else must stay equal).
-EXPECTED_PKGS="flashinfer-python specgen setuptools ninja"
+# (flashinfer: the old name of a stock FlashInfer the clone may have had, removed in step e;
+# pytest and its runtime deps: step "pytest", plus any module it names in pytest_extra.txt)
+EXPECTED_PKGS="flashinfer-python flashinfer specgen setuptools ninja pytest iniconfig pluggy pygments"
+PYTEST_PKGS="pytest iniconfig pluggy"
 CMAKE_MIN=3.30.4          # 3rdparty/raft/cpp/CMakeLists.txt:13, cmake/RAPIDS.cmake (FATAL_ERROR)
 SETUPTOOLS_MIN=77         # flashinfer pyproject: build-system requires setuptools>=77 (PEP 639 license)
 SETUPTOOLS_SPEC="setuptools>=77.0.3,<80"   # the range vLLM 0.9.1 itself pins (for Python > 3.11)
 GCC_MIN=9.3               # 3rdparty/raft/docs/source/build.md "GCC 9.3+"
 
 # Nothing here should be steered by the caller's Python environment.
-if [ -n "${PYTHONPATH:-}" ] || [ -n "${PYTHONHOME:-}" ]; then
-    echo "[build_sparsespec_env] unsetting PYTHONPATH/PYTHONHOME of the calling shell (set explicitly where needed)"
+if [ -n "${PYTHONPATH:-}" ] || [ -n "${PYTHONHOME:-}" ] || [ -n "${PIP_TARGET:-}" ] || [ -n "${PIP_PREFIX:-}" ]; then
+    echo "[build_sparsespec_env] unsetting PYTHONPATH/PYTHONHOME/PIP_TARGET/PIP_PREFIX of the calling shell (set explicitly where needed)"
 fi
-unset PYTHONPATH PYTHONHOME
-export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
+# PIP_TARGET / PIP_PREFIX (pip's --target / --prefix) would redirect every pip install of this build
+unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_PREFIX
+# PIP_USER=0: a pip config with `user = true` (or PIP_USER=1, or a site-packages pip cannot write to)
+# would send installs into ~/.local, which verl-baseline imports too, and would cut `pip list` down to
+# user-site packages. The variable overrides every pip config file; `conda run` passes it on.
+# PYTHONNOUSERSITE is deliberately NOT set: it does not stop user installs, and it would hide the
+# user site from the probes and the tripwire while the training runs still import from it.
+# PIP_REQUIRE_VIRTUALENV=0: a conda env is not a virtualenv, so a pip config with
+# `require-virtualenv = true` would refuse every install here; where pip writes is checked below.
+export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_USER=0 PIP_REQUIRE_VIRTUALENV=0
 
 ss_init build_sparsespec_env
 ss_log "mode=$MODE env=$ENV_NAME base=$BASE_ENV repo=$REPO_ROOT"
@@ -209,7 +222,7 @@ print("sys_prefix=" + os.path.realpath(sys.prefix))
 print("conda_prefix=" + os.environ.get("CONDA_PREFIX", ""))
 for n in ("torch", "transformers", "verl", "vllm", "numpy", "tensordict", "triton", "setuptools",
           "packaging", "pip", "ninja", "numba", "jinja2", "wandb", "flashinfer-python", "flashinfer",
-          "specgen", "datasets", "antlr4-python3-runtime", "hydra-core", "cmake"):
+          "specgen", "datasets", "antlr4-python3-runtime", "hydra-core", "cmake", "pytest"):
     print("ver.%s=%s" % (n, ver(n)))
 for n in ("flashinfer-python", "specgen", "verl", "vllm"):
     print("url.%s=%s" % (n, direct_url(n)))
@@ -242,7 +255,14 @@ s = importlib.util.find_spec("flashinfer")
 print("flashinfer_origin=" + (s.origin or "" if s else ""))
 us = site.getusersitepackages()
 n_us = len(os.listdir(us)) if os.path.isdir(us) else 0
-print("user_site=%s" % us)
+print("user_site=%s" % os.path.realpath(us))
+# where each package the build may replace resolves (pip uninstalls a replaced package wherever it
+# lives, the user site included, when not in a virtualenv)
+for n in ("setuptools", "flashinfer-python", "flashinfer", "specgen"):
+    try:
+        print("loc.%s=%s" % (n, os.path.realpath(str(md.distribution(n).locate_file("")))))
+    except Exception:
+        print("loc.%s=" % n)
 print("user_site_entries=%d" % (n_us if site.ENABLE_USER_SITE else 0))
 print("env.INSTALL_PREFIX=" + os.environ.get("INSTALL_PREFIX", ""))
 print("env.PREFIX=" + os.environ.get("PREFIX", ""))
@@ -402,12 +422,106 @@ except Exception:
     sys.exit(1)
 print("batch_topk_csr built and loaded in %.0f s: %s" % (time.time() - t0, so))
 print("op: %s" % mod.batch_topk)
-out = subprocess.run(["ldd", str(so)], capture_output=True, text=True).stdout
-print(out)
-missing = [l.strip() for l in out.splitlines() if "not found" in l]
-for l in missing:
-    print("PROBLEM: unresolved library: " + l)
-sys.exit(2 if missing else 0)
+# The load above is the check. The JIT links with -L only (no rpath), so a plain ldd in a new process
+# cannot see torch/lib or $PREFIX/lib; show it with those dirs added, for information only.
+import torch
+from torch.utils.cpp_extension import CUDA_HOME
+prefix = os.environ.get("INSTALL_PREFIX") or os.environ.get("PREFIX") or os.environ.get("CONDA_PREFIX") or ""
+dirs = [os.path.join(os.path.dirname(torch.__file__), "lib"), os.path.join(prefix, "lib")]
+if CUDA_HOME:
+    dirs.append(os.path.join(CUDA_HOME, "lib64"))
+if os.environ.get("LD_LIBRARY_PATH"):
+    dirs.append(os.environ["LD_LIBRARY_PATH"])
+env = dict(os.environ, LD_LIBRARY_PATH=":".join(dirs))
+print("ldd with LD_LIBRARY_PATH=%s (information only: the load above is the check)" % env["LD_LIBRARY_PATH"])
+try:
+    r = subprocess.run(["ldd", str(so)], capture_output=True, text=True, env=env)
+    print(r.stdout + r.stderr)
+except OSError as e:
+    print("info: could not run ldd: %s" % e)
+try:
+    with open("/proc/self/maps") as f:
+        mapped = sorted({l.split()[-1] for l in f if l.split()[-1].startswith("/")})
+except OSError:
+    mapped = []
+for p in mapped:
+    b = os.path.basename(p)
+    if any(k in b for k in ("rmm", "rapids_logger", "c10", "torch", "cudart", "batch_topk")):
+        print("mapped in this process: " + p)
+sys.exit(0)
+EOF
+
+cat > "$PY_DIR/pip_target.py" <<'EOF'
+# ss-helper: pip_target. Where would `python -m pip install` of THIS interpreter put a package?
+# Installs a throwaway 2-file wheel with --root into a temp dir (nothing is written to the env), then
+# reads back the site-packages dir pip chose. A pip config `user = true`, PIP_USER=1 or a
+# site-packages pip cannot write to shows up as a target outside sys.prefix (exit 2); pip failing
+# (e.g. a broken pip install) exits 1 with pip's message.
+import atexit
+import base64
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+NAME = "ss_pip_target_probe"
+prefix = os.path.realpath(sys.prefix)
+print("sys_prefix=" + prefix)
+print("PIP_USER=" + os.environ.get("PIP_USER", "<unset>"))
+tmp = tempfile.mkdtemp(prefix="ss_pip_target.")
+atexit.register(shutil.rmtree, tmp, True)  # the probe leaves nothing behind
+files = {NAME + "/__init__.py": b"",
+         NAME + "-0.dist-info/METADATA": ("Metadata-Version: 2.1\nName: %s\nVersion: 0\n" % NAME).encode(),
+         NAME + "-0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: ss\nRoot-Is-Purelib: true\nTag: py3-none-any\n"}
+rec = ["%s,sha256=%s,%d" % (k, base64.urlsafe_b64encode(hashlib.sha256(v).digest()).rstrip(b"=").decode(), len(v))
+       for k, v in files.items()] + [NAME + "-0.dist-info/RECORD,,"]
+files[NAME + "-0.dist-info/RECORD"] = ("\n".join(rec) + "\n").encode()
+whl = os.path.join(tmp, NAME + "-0-py3-none-any.whl")
+with zipfile.ZipFile(whl, "w") as z:
+    for k, v in files.items():
+        z.writestr(k, v)
+root = os.path.join(tmp, "root")
+cfg = subprocess.run([sys.executable, "-m", "pip", "config", "list"], capture_output=True, text=True)
+for line in cfg.stdout.splitlines():
+    if line.split("=", 1)[0].strip().endswith(".user"):
+        print("pip_config_user=" + line.strip())
+r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--no-compile",
+                    "--no-warn-script-location", "--root", root, whl], capture_output=True, text=True)
+found = ""
+for d, _, names in os.walk(root):
+    if os.path.basename(d) == NAME and "__init__.py" in names:
+        found = "/" + os.path.relpath(os.path.dirname(d), root)
+        break
+if r.returncode != 0 or not found:
+    print("pip_rc=%d" % r.returncode)
+    for line in (r.stdout + r.stderr).strip().splitlines()[-8:]:
+        print("pip| " + line)
+    print("target=")
+    sys.exit(1)
+target = os.path.realpath(found) if os.path.isdir(found) else found
+print("target=" + target)
+sys.exit(0 if (target + os.sep).startswith(prefix + os.sep) else 2)
+EOF
+
+cat > "$PY_DIR/pytest_check.py" <<'EOF'
+# ss-helper: pytest_check. Does `import pytest` work? Prints missing_module=<name> when an import fails.
+import sys
+import traceback
+
+try:
+    import pytest
+except ModuleNotFoundError as e:
+    traceback.print_exc()
+    print("missing_module=" + (e.name or "").split(".")[0])
+    sys.exit(1)
+except Exception:
+    traceback.print_exc()
+    print("missing_module=")
+    sys.exit(1)
+print("pytest %s at %s" % (pytest.__version__, pytest.__file__))
 EOF
 
 cat > "$PY_DIR/with_path.sh" <<'EOF'
@@ -433,6 +547,7 @@ NEED_SUBMODULE_INIT=""        # list of submodule paths to init
 CMAKE_EXE=""                  # cmake to use (empty: install into the tools venv)
 NEED_SETUPTOOLS=0
 NEED_NINJA=0
+NEED_PYTEST=0
 CUDA_HOME_FOUND=""
 NVCC=""
 NVCC_VER=""
@@ -446,6 +561,22 @@ read_submodule_facts
 
 probe_env() {  # probe_env ENV OUTFILE: run env_probe.py inside the env (read-only)
     env_q "$1" env PYTHONDONTWRITEBYTECODE=1 python -B "$PY_DIR/env_probe.py" > "$2" 2>"$2.err"
+}
+
+# pip_target_check ENV: 0 when `python -m pip install` in ENV writes into ENV's own site-packages.
+# Sets PIP_TARGET_MSG (one line for a FAIL / ok message); the full output is in $PY_DIR/pip_target.ENV.
+PIP_TARGET_MSG=""
+pip_target_check() {
+    local out="$PY_DIR/pip_target.$1" rc=0 t
+    env_q "$1" env PYTHONDONTWRITEBYTECODE=1 python -B "$PY_DIR/pip_target.py" > "$out" 2>&1 || rc=$?
+    t=$(kv target "$out")
+    case "$rc" in
+        0) PIP_TARGET_MSG="pip in $1 installs into $t (PIP_USER=$(kv PIP_USER "$out"))" ;;
+        2) PIP_TARGET_MSG="pip in $1 would install into $t, outside the env prefix $(kv sys_prefix "$out") (a pip 'user' setting or an unwritable site-packages; PIP_USER as pip sees it: $(kv PIP_USER "$out")). That would put packages into the user site, which $BASE_ENV imports too. Check: conda run -n $1 python -m pip config list; and that this shell does not override PIP_USER" ;;
+        *) PIP_TARGET_MSG="a throwaway 'pip install --no-index --root <tmp>' of a local wheel failed in $1 (exit $rc; pip's output above), so every pip install of this build would fail too" ;;
+    esac
+    if [ "$rc" != 0 ]; then sed 's/^/            | /' "$out"; else grep '^pip_config_user=' "$out" | sed 's/^/            | /' || true; fi
+    return "$rc"
 }
 
 submodule_state() {  # prints "<flag> <checked-out sha> <recorded sha>" for one submodule path
@@ -580,6 +711,12 @@ run_checks() {
     # the probe of the env that will be built on: the clone if it exists, otherwise the base
     if [ "$ENV_EXISTS" = 1 ]; then P="$ENV_PROBE"; else P="$BASE_PROBE"; fi
 
+    # -- where pip installs (PIP_USER=0 is exported above; this proves it reaches pip) --------
+    # The clone inherits the base env's pip and the same user/global pip config, so before the clone
+    # exists the base env answers for it (pip install --root <tmp>: nothing is written into it).
+    if [ "$ENV_EXISTS" = 1 ]; then f=$ENV_NAME; else f=$BASE_ENV; fi
+    if pip_target_check "$f"; then ck_ok "$PIP_TARGET_MSG"; else ck_fail "$PIP_TARGET_MSG"; fi
+
     # -- git + submodules (flashinfer, raft; never vllm) ---------------------------------------
     if ! command -v git >/dev/null 2>&1; then
         ck_fail "git not found"
@@ -609,7 +746,7 @@ run_checks() {
     CUDA_HOME_FOUND=$(kv cuda_home "$P")
     torch_cuda=$(kv torch_cuda "$P")
     if [ -z "$CUDA_HOME_FOUND" ] || [ ! -x "$CUDA_HOME_FOUND/bin/nvcc" ]; then
-        ck_fail "no nvcc for the env (CUDA_HOME='${CUDA_HOME:-}', resolution: $(kv cuda_home_how "$P") -> '${CUDA_HOME_FOUND}'). The FlashInfer JIT and RAFT both need a CUDA $(major_of "$torch_cuda").x toolkit: export CUDA_HOME=/path/to/cuda-$torch_cuda (or e.g. 'conda install -n $ENV_NAME -c nvidia/label/cuda-$torch_cuda.0 cuda-toolkit' into the clone - a decision, it adds conda packages)"
+        ck_fail "no nvcc for the env (CUDA_HOME='${CUDA_HOME:-}', resolution: $(kv cuda_home_how "$P") -> '${CUDA_HOME_FOUND}'). The FlashInfer JIT and RAFT both need a CUDA $(major_of "$torch_cuda").x toolkit with the standard layout (bin/nvcc, include/cuda_runtime.h, lib64/libcudart.so): export CUDA_HOME=/path/to/cuda-$torch_cuda (e.g. after 'module load cuda/$torch_cuda', or NVIDIA's runfile installed without root: 'sh cuda_${torch_cuda}.<x>_<driver>_linux.run --silent --toolkit --toolkitpath=\$HOME/cuda-$torch_cuda'), rerun --check, and keep CUDA_HOME exported in the shell that later runs integration/run_all_gates.sh. Do NOT conda-install cuda-toolkit into either env: conda's CUDA 12 packages put cuda_runtime.h under targets/x86_64-linux/include and have no lib64, and the JIT only uses \$cuda_home/include and -L\$cuda_home/lib64 (flashinfer/jit/cpp_ext.py:67,117)"
     else
         NVCC="$CUDA_HOME_FOUND/bin/nvcc"
         NVCC_VER=$("$NVCC" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9.]*\),.*/\1/p' | head -1) || NVCC_VER=""
@@ -626,9 +763,6 @@ run_checks() {
             ver_ge "$NVCC_VER" 12.9 || ck_warn "upstream used CUDA 12.9 (README.md:207). The JIT compiles RAFT/rmm 25.10 headers with -I\$CONDA_PREFIX/include only (backend.py:311,336) while rapids-cmake installs CCCL 3.0.3 under include/rapids, so the toolkit's bundled CCCL is used: older toolkits may fail to compile the top-k op. The JIT smoke step tests exactly this."
         fi
         [ -f "$CUDA_HOME_FOUND/include/cuda_runtime.h" ] || ck_fail "$CUDA_HOME_FOUND/include/cuda_runtime.h missing (CUDA headers needed by the JIT: flashinfer/jit/cpp_ext.py:68)"
-        if ! ls "$CUDA_HOME_FOUND"/lib64/libcudart.so* >/dev/null 2>&1; then
-            ck_warn "$CUDA_HOME_FOUND/lib64/libcudart.so* not found (the JIT links -L\$cuda_home/lib64 -lcudart: flashinfer/jit/cpp_ext.py:117-123)"
-        fi
     fi
 
     # -- host compiler -------------------------------------------------------------------------
@@ -658,13 +792,36 @@ run_checks() {
         libenv="${ENV_PREFIX:-$BASE_PREFIX}/lib/libstdc++.so.6"
         libcc=$("$GXX" -print-file-name=libstdc++.so.6 2>/dev/null || true)
         if [ -e "$libenv" ] && [ -n "$libcc" ] && [ -e "$libcc" ]; then
-            ge=$(grep -ao 'GLIBCXX_3\.4\.[0-9]*' "$libenv" 2>/dev/null | sort -u -t. -k3,3n | tail -1)
-            gc=$(grep -ao 'GLIBCXX_3\.4\.[0-9]*' "$libcc" 2>/dev/null | sort -u -t. -k3,3n | tail -1)
+            ge=$({ grep -ao 'GLIBCXX_3\.4\.[0-9]*' "$libenv" 2>/dev/null || true; } | sort -u -t. -k3,3n | tail -1)
+            gc=$({ grep -ao 'GLIBCXX_3\.4\.[0-9]*' "$libcc" 2>/dev/null || true; } | sort -u -t. -k3,3n | tail -1)
             if [ -n "$ge" ] && [ -n "$gc" ] && ! ver_ge "${ge#GLIBCXX_}" "${gc#GLIBCXX_}"; then
                 ck_warn "the env's $libenv provides up to $ge, the compiler's libstdc++ $gc: JIT modules may fail to load with 'GLIBCXX_... not found' (README.md:281-292). Not fixed automatically: replacing the env's libstdc++ would also change what the training path loads."
             else
                 ck_ok "libstdc++: env ${ge:-?}, compiler ${gc:-?}"
             fi
+        fi
+    fi
+
+    # -- the JIT's own link line for cudart (flashinfer/jit/cpp_ext.py:115-135:
+    #    '$cxx ... -L$cuda_home/lib64 -lcudart' + FLASHINFER_EXTRA_LDFLAGS). Blocking: without it every
+    #    FlashInfer JIT module fails to link at the engine's first start. A Debian-style toolkit
+    #    (CUDA_HOME=/usr, libcudart in the linker's default path) passes without a lib64.
+    #    The linker is the JIT's: CXX or 'c++' as resolved INSIDE the env (cpp_ext.py:141; the env's
+    #    activation scripts may set CXX, e.g. conda compilers), not this shell's $GXX.
+    if [ -n "$NVCC" ]; then
+        if [ "$ENV_EXISTS" = 1 ]; then jit_env=$ENV_NAME; else jit_env=$BASE_ENV; fi
+        # ninja splits $cxx on spaces ("ccache g++" works), so only its first word must be on PATH
+        # shellcheck disable=SC2016  # expanded by the sh inside the env
+        jit_cxx=$(env_q "$jit_env" sh -c 'set -- ${CXX:-c++}; p=$(command -v "$1") || exit 1; shift; echo "ss_cxx=$p${1:+ $*}"' 2>/dev/null | sed -n 's/^ss_cxx=//p' | tail -1) || jit_cxx=""
+        lt="$PY_DIR/ldprobe"; mkdir -p "$lt"
+        printf 'int ss_ldprobe;\n' > "$lt/p.cc"
+        if [ -z "$jit_cxx" ]; then
+            ck_fail "the FlashInfer JIT links with '${CXX:-c++}' (CXX, else c++; flashinfer/jit/cpp_ext.py:141) run inside $jit_env, and that is not on PATH there. Export CXX=<path of a GCC >= $GCC_MIN g++> in this shell and in the shell that runs run_all_gates.sh, then rerun --check"
+        # shellcheck disable=SC2086  # $jit_cxx (as ninja splits it) and FLASHINFER_EXTRA_LDFLAGS are word lists
+        elif $jit_cxx -x c++ "$lt/p.cc" -shared -fPIC -L"$CUDA_HOME_FOUND/lib64" ${FLASHINFER_EXTRA_LDFLAGS:-} -lcudart -o "$lt/p.so" > "$lt/out.txt" 2>&1; then
+            ck_ok "the JIT's link line resolves -lcudart ($jit_cxx -L$CUDA_HOME_FOUND/lib64${FLASHINFER_EXTRA_LDFLAGS:+ $FLASHINFER_EXTRA_LDFLAGS} + the linker's default paths)"
+        else
+            ck_fail "every FlashInfer JIT module links with '$jit_cxx ... -L$CUDA_HOME_FOUND/lib64 -lcudart' (flashinfer/jit/cpp_ext.py:115-123,141; the compiler as resolved inside $jit_env) and that link fails here: $(tail -2 "$lt/out.txt" | tr '\n' ' '). Use a toolkit with lib64/libcudart.so (see the CUDA_HOME advice: module load / NVIDIA runfile with --toolkitpath), or export FLASHINFER_EXTRA_LDFLAGS=-L<dir containing libcudart.so> in the shell for both this build and run_all_gates.sh. Do not install CUDA packages into $BASE_ENV or $ENV_NAME to fix this."
         fi
     fi
 
@@ -697,6 +854,29 @@ run_checks() {
     fi
     v=$(kv ver.packaging "$P")
     ver_ge "${v:-0}" 24 || ck_warn "packaging ${v:-none} < 24 (the fork's build-system lists packaging>=24; not enforced with --no-build-isolation and setuptools vendors its own; left alone)"
+    v=$(kv ver.pytest "$P")
+    if [ -n "$v" ]; then
+        ck_ok "pytest $v in the env (integration/run_all_gates.sh runs the test stages with it; 'import pytest' is checked in the build)"
+    else
+        NEED_PYTEST=1
+        ck_info "no pytest in the env: the build installs $PYTEST_PKGS --no-deps into the clone only (the gate runner needs it and installs nothing itself)"
+    fi
+    # PIP_USER=0 only steers writes: outside a virtualenv pip uninstalls a package it replaces wherever
+    # it is found, ~/.local included. Packages the build replaces must therefore not resolve there.
+    # (pytest, iniconfig, pluggy, pygments, ninja are installed without a version spec only when
+    # missing, so a user-site copy is used as it is and never replaced.)
+    v=$(kv user_site "$P")
+    rp_pkgs="flashinfer-python flashinfer"
+    if [ "$NEED_SETUPTOOLS" = 1 ]; then rp_pkgs="setuptools $rp_pkgs"; fi
+    if [ "$SPECGEN_INSTALL" = editable ]; then rp_pkgs="$rp_pkgs specgen"; fi
+    for f in $rp_pkgs; do
+        rp_loc=$(kv "loc.$f" "$P")
+        if [ -n "$v" ] && [ -n "$rp_loc" ]; then
+            case "$rp_loc/" in
+                "$v"/*) ck_fail "$f resolves to the user site $rp_loc, which $BASE_ENV imports too: replacing it in the clone would make pip uninstall it from there. Move it out of the user site yourself (deciding what $BASE_ENV should import; 'python -m pip list --user' shows what is there), then rerun --check" ;;
+            esac
+        fi
+    done
 
     # -- GPU -----------------------------------------------------------------------------------
     if command -v nvidia-smi >/dev/null 2>&1; then
@@ -704,7 +884,7 @@ run_checks() {
             || v=$(nvidia-smi --query-gpu=index,name,memory.used,memory.total,driver_version --format=csv,noheader 2>/dev/null) || v=""
         if [ -n "$v" ]; then
             printf '%s\n' "$v" | while IFS= read -r line; do ck_info "GPU $line"; done
-            f=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)
+            f=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1) || f=""
             if [ -n "$f" ] && [ -n "$NVCC_VER" ] && ! ver_ge "$f" "$NVCC_VER"; then
                 ck_warn "driver supports CUDA $f, nvcc is $NVCC_VER"
             fi
@@ -810,7 +990,11 @@ print_plan() {
     ss_log "                     (README.md:196-198; INSTALL_PREFIX=<env prefix>, LIBRAFT_BUILD_DIR=$RAFT_BUILD_DIR, CPM_SOURCE_CACHE=$CPM_CACHE_DIR, rapids branch $RAPIDS_BRANCH)"
     if [ "$SPECGEN_INSTALL" = editable ]; then s="pip install --no-deps -e .   (the owner's 'pip install -e .' without its dependency pins)"; else s="skip (SPECGEN_INSTALL=none)"; fi
     ss_log "  g. this repo:      $s"
-    ss_log "  h. verify:         import flashinfer + serve.rl.engine; RAFT/librmm where backend.py looks;$(if [ "$SKIP_JIT_SMOKE" != 1 ]; then echo ' JIT-compile the top-k op;'; fi) drift report vs $BASE_ENV; $BASE_ENV fingerprint unchanged"
+    if [ "$NEED_PYTEST" = 1 ]; then s="pip install --no-deps $PYTEST_PKGS, then any module 'import pytest' still names (one at a time, --no-deps)"
+    else s="none (pytest $(kv ver.pytest "$P") present; 'import pytest' is checked)"; fi
+    ss_log "  h. pytest:         $s"
+    ss_log "  i. verify:         import flashinfer + serve.rl.engine; RAFT/librmm where backend.py looks;$(if [ "$SKIP_JIT_SMOKE" != 1 ]; then echo ' JIT-compile the top-k op;'; fi) import pytest; drift report vs $BASE_ENV; $BASE_ENV fingerprint unchanged"
+    ss_log "  every pip install above is checked first to write into $ENV_NAME, not the user site (PIP_USER=0), and no package it replaces lives in the user site"
     ss_log "  NOT done: the vLLM fork; patched verl (next: bash integration/setup_env.sh $ENV_NAME)"
 }
 
@@ -824,7 +1008,12 @@ fingerprint_base() {  # fingerprint_base OUT: package lists of the base env (rea
 }
 
 print_next() {
-    local p=${ENV_PREFIX:-<prefix of $ENV_NAME>}
+    local p=${ENV_PREFIX:-<prefix of $ENV_NAME>} cuda_exports=""
+    # the toolkit (and linker flags / compiler) this build was checked with; the JIT at gate time
+    # resolves CUDA_HOME, FLASHINFER_EXTRA_LDFLAGS and CXX from the shell that runs the gates
+    if [ -n "$CUDA_HOME_FOUND" ]; then cuda_exports="export CUDA_HOME=$(printf '%q' "$CUDA_HOME_FOUND")"; fi
+    if [ -n "${FLASHINFER_EXTRA_LDFLAGS:-}" ]; then cuda_exports="${cuda_exports:-export} FLASHINFER_EXTRA_LDFLAGS=$(printf '%q' "$FLASHINFER_EXTRA_LDFLAGS")"; fi
+    if [ -n "${CXX:-}" ]; then cuda_exports="${cuda_exports:-export} CXX=$(printf '%q' "$CXX")"; fi
     cat <<EOF
 
 [$SS_SCRIPT] ---------------------------------------------------------------- next
@@ -832,8 +1021,12 @@ print_next() {
        bash integration/setup_env.sh $ENV_NAME
 [$SS_SCRIPT] 2) re-run the drift report afterwards (verl becomes an editable 0.5.0; versions must still match):
        bash integration/build_sparsespec_env.sh --verify
-[$SS_SCRIPT] 3) then RUNBOOK.md section 1b (pytest) and section 4 (engine GPU tests, gates 3b/3c/3d).
-[$SS_SCRIPT]    Run the engine from a shell where INSTALL_PREFIX and PREFIX are unset (backend.py:305-307).
+[$SS_SCRIPT] 3) then the gate run, one command (see HANDOFF.md). Run these lines in the shell that runs it; with
+[$SS_SCRIPT]    tmux, run them INSIDE the tmux session (a new tmux session does not get this shell's exports).
+[$SS_SCRIPT]    backend.py:305-307 prefers INSTALL_PREFIX/PREFIX over CONDA_PREFIX, and the JIT must use the same
+[$SS_SCRIPT]    CUDA toolkit as this build:
+       unset INSTALL_PREFIX PREFIX${cuda_exports:+; $cuda_exports}
+       bash integration/run_all_gates.sh
 
 [$SS_SCRIPT] ---------------------------------------------------------------- packaging for the shared Drive
 [$SS_SCRIPT] Recommended: conda-pack (relocatable: conda-unpack rewrites the hard-coded prefix in scripts and
@@ -842,9 +1035,11 @@ print_next() {
 [$SS_SCRIPT] this checkout; conda-pack refuses them unless told to skip them, so they are re-installed after
 [$SS_SCRIPT] unpacking from a checkout at the recorded commits. FLASHINFER_EDITABLE=0 makes the fork part of
 [$SS_SCRIPT] the archive instead. conda-pack goes into the tools venv, not into any conda env:
+[$SS_SCRIPT] --ignore-missing-files: if the clone's setuptools was a conda package older than 77, the build replaced it with
+[$SS_SCRIPT] pip (build prerequisites step); conda-pack would otherwise stop on the conda-managed setuptools files pip removed.
        $TOOLS_DIR/bin/python -m pip install conda-pack
        OUT=\$HOME/verl-sparsespec-pack; mkdir -p "\$OUT"
-       $TOOLS_DIR/bin/conda-pack -p "$p" --ignore-editable-packages -o "\$OUT/$ENV_NAME.tar.gz"
+       $TOOLS_DIR/bin/conda-pack -p "$p" --ignore-editable-packages --ignore-missing-files -o "\$OUT/$ENV_NAME.tar.gz"
        # RAFT/rmm files were installed by cmake, not by conda or pip: confirm they are in the archive
        tar -tzf "\$OUT/$ENV_NAME.tar.gz" | grep -E '(^|/)lib/librmm\.so\$|(^|/)include/raft/matrix/detail/select_k\.cuh\$'
        # if that prints nothing, ship them separately from cmake's install manifest:
@@ -984,6 +1179,9 @@ if [ "$MODE" = build ]; then
 
     # -----------------------------------------------------------------------------------------
     ss_step "build prerequisites inside the clone (only if missing; --no-deps)"
+    # before the first pip install into the clone: pip must write into the clone, not ~/.local
+    pip_target_check "$ENV_NAME" || ss_die "$PIP_TARGET_MSG"
+    ss_log "$PIP_TARGET_MSG"
     probe_env "$ENV_NAME" "$ENV_PROBE" || ss_die "probe of $ENV_NAME failed"
     if ! ver_ge "$(kv ver.setuptools "$ENV_PROBE")" "$SETUPTOOLS_MIN"; then
         # 3rdparty/flashinfer/pyproject.toml: license = "Apache-2.0" + license-files (PEP 639) need
@@ -1124,6 +1322,48 @@ if [ "$MODE" = build ]; then
     else
         ss_log "skipped (SPECGEN_INSTALL=$SPECGEN_INSTALL)"
     fi
+
+    # -----------------------------------------------------------------------------------------
+    ss_step "pytest for the gate runner (only if 'import pytest' fails; --no-deps)"
+    # integration/run_all_gates.sh runs the CPU tests and the GPU unit tests (a required gate) with
+    # this env's pytest and installs nothing itself. --no-deps, and pip leaves a package that is
+    # already installed as it is, so no package already in the clone changes: only missing ones are
+    # added. A module 'import pytest' still misses (pygments for pytest >= 8.4, ...) is added
+    # alone, by its module name, and recorded in pytest_extra.txt for the drift report.
+    pytest_extra="$REPORT_DIR/pytest_extra.txt"
+    [ -f "$pytest_extra" ] || : > "$pytest_extra"
+    pt_out="$PY_DIR/pytest_check.out"
+    pt_tried=""
+    pt_round=0
+    mkdir -p "$BUILD_DIR/run"
+    while :; do
+        pt_rc=0
+        (cd "$BUILD_DIR/run" && env_q "$ENV_NAME" env PYTHONDONTWRITEBYTECODE=1 python -B "$PY_DIR/pytest_check.py") > "$pt_out" 2>&1 || pt_rc=$?
+        if [ "$pt_rc" = 0 ]; then
+            ss_log "import pytest works: $(grep '^pytest ' "$pt_out" | tail -1)"
+            break
+        fi
+        miss=$(kv missing_module "$pt_out")
+        if [ "$pt_round" = 0 ] && [ "$miss" = pytest ]; then
+            # shellcheck disable=SC2086  # PYTEST_PKGS is a list of names
+            env_run "$ENV_NAME" python -m pip install --no-deps $PYTEST_PKGS \
+                || ss_die "pip install --no-deps $PYTEST_PKGS into $ENV_NAME failed (output above; PyPI reachable? see the network check)"
+        elif [ -n "$miss" ] && [ "$miss" != pytest ] && [ "$pt_round" -lt 4 ] \
+            && case " $pt_tried " in *" $miss "*) false ;; *) true ;; esac; then
+            ss_log "'import pytest' still fails: module '$miss' is missing; installing exactly that, --no-deps"
+            env_run "$ENV_NAME" python -m pip install --no-deps "$miss" \
+                || ss_die "'import pytest' in $ENV_NAME fails: module '$miss' is missing, and 'pip install --no-deps $miss' failed (output above; the package may have another name). Install the package that provides '$miss' with: conda run -n $ENV_NAME python -m pip install --no-deps <package>, then rerun"
+            pt_tried="$pt_tried $miss"
+            grep -qxF "$miss" "$pytest_extra" || echo "$miss" >> "$pytest_extra"
+        else
+            sed 's/^/    /' "$pt_out"
+            if [ -n "$miss" ]; then
+                ss_die "'import pytest' in $ENV_NAME still fails: module '$miss' is missing (tried:${pt_tried:- nothing}). Install it by hand with: conda run -n $ENV_NAME python -m pip install --no-deps <the package that provides $miss>, then rerun"
+            fi
+            ss_die "'import pytest' in $ENV_NAME fails, and not because of a missing module (traceback above)"
+        fi
+        pt_round=$((pt_round + 1))
+    done
 fi
 
 # =============================================================================================
@@ -1159,10 +1399,18 @@ else
         ss_log "top-k op compiled and loaded"
     else
         VERIFY_FAIL=1
-        ss_warn "JIT SMOKE FAILED (output above, saved to $REPORT_DIR/jit_smoke.txt). If a library is 'not found'"
-        ss_warn "(librmm.so / librapids_logger.so), the JIT .so has no rpath (backend.py:341 passes only -L): report it;"
+        ss_warn "JIT SMOKE FAILED (output above, saved to $REPORT_DIR/jit_smoke.txt): building or loading batch_topk_csr raised."
+        ss_warn "If the traceback names a missing librmm.so / librapids_logger.so, the dlopen inside python could not resolve it (backend.py:341 passes only -L, no rpath): report it;"
         ss_warn "if nvcc fails inside raft/rmm/cuda headers, compare the toolkit's CCCL with the one RAFT expects (include/rapids)."
     fi
+fi
+
+ss_step "verify: pytest imports in $ENV_NAME (the gate runner's test stages need it)"
+if (cd "$BUILD_DIR/run" && env_run "$ENV_NAME" env PYTHONDONTWRITEBYTECODE=1 python -B "$PY_DIR/pytest_check.py"); then
+    ss_log "pytest OK"
+else
+    VERIFY_FAIL=1
+    ss_warn "PYTEST CHECK FAILED: 'import pytest' fails in $ENV_NAME (output above); run_all_gates.sh would skip the CPU and GPU test stages. A build run (without --verify) installs it."
 fi
 
 ss_step "verify: package drift $BASE_ENV -> $ENV_NAME"
@@ -1173,7 +1421,10 @@ env_q "$ENV_NAME" python -m pip freeze > "$REPORT_DIR/env.pip-freeze.txt" || tru
 "$CONDA_BIN" list -n "$BASE_ENV" --export > "$REPORT_DIR/base.conda-export.txt" 2>/dev/null || true
 "$CONDA_BIN" list -n "$ENV_NAME" --export > "$REPORT_DIR/env.conda-export.txt" 2>/dev/null || true
 crit=$(printf '%s' "$CRITICAL_PKGS" | tr ' ' ',')
-expd=$(printf '%s' "$EXPECTED_PKGS" | tr ' ' ',')
+pt_extra=""
+if [ -f "$REPORT_DIR/pytest_extra.txt" ]; then pt_extra=$(tr '\n' ' ' < "$REPORT_DIR/pytest_extra.txt"); fi
+# shellcheck disable=SC2086  # split the name lists on purpose
+expd=$(printf '%s\n' $EXPECTED_PKGS $pt_extra | tr '\n' ',')
 drift_rc=0
 env_q "$ENV_NAME" python "$PY_DIR/drift.py" "$REPORT_DIR/base.pip-list.txt" "$REPORT_DIR/env.pip-list.txt" \
     "$crit" "$expd" "$REPORT_DIR/drift.md" > "$PY_DIR/drift.out" || drift_rc=$?
@@ -1191,10 +1442,23 @@ if [ "${n_unexp:-0}" != 0 ]; then
     if [ "$STRICT_DRIFT" = 1 ]; then VERIFY_FAIL=1; fi
 fi
 # conda-level packages (not pip): report only
-grep -v 'pypi_0' "$REPORT_DIR/base.conda-export.txt" 2>/dev/null | grep -v '^#' | sort > "$PY_DIR/c1" || true
-grep -v 'pypi_0' "$REPORT_DIR/env.conda-export.txt" 2>/dev/null | grep -v '^#' | sort > "$PY_DIR/c2" || true
+# (pypi_0: installed by pip; dev_0: an egg-link editable install. When pip replaces a conda package,
+# e.g. setuptools in the prerequisites step, conda drops that package's record, so it shows here.)
+grep -v -e '=pypi_0$' -e '=dev_0$' "$REPORT_DIR/base.conda-export.txt" 2>/dev/null | grep -v '^#' | sort > "$PY_DIR/c1" || true
+grep -v -e '=pypi_0$' -e '=dev_0$' "$REPORT_DIR/env.conda-export.txt" 2>/dev/null | grep -v '^#' | sort > "$PY_DIR/c2" || true
 if ! cmp -s "$PY_DIR/c1" "$PY_DIR/c2"; then
-    ss_warn "conda packages (non-pip) differ between the envs:"
+    # diff exits 1 here by definition (the files differ); under pipefail that must not stop the script
+    c_names=$({ diff "$PY_DIR/c1" "$PY_DIR/c2" || true; } | sed -n 's/^[<>] \([^=]*\)=.*/\1/p' | sort -u | tr '\n' ' ')
+    c_names=${c_names% }
+    c_unexp=""
+    for f in $c_names; do
+        case " $EXPECTED_PKGS " in *" $f "*) ;; *) c_unexp="$c_unexp $f" ;; esac
+    done
+    if [ -n "$c_unexp" ]; then
+        ss_warn "conda packages (non-pip) differ between the envs (not only packages this script replaces:$c_unexp):"
+    else
+        ss_log "conda packages (non-pip): only $c_names differ, which this script replaced with pip (expected):"
+    fi
     diff "$PY_DIR/c1" "$PY_DIR/c2" | sed 's/^/    /' || true
 else
     ss_log "conda packages (non-pip): identical"
