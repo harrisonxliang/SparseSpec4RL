@@ -106,14 +106,15 @@ FAIL. If a gate fails, stop and record the numbers; do not change thresholds to 
 
 `baseline/results/sparsespec_checks/3a_sampler_review.md`. Nothing to run.
 
-### Engine unit tests (GPU, about 10 GiB free)
+### Engine unit tests (GPU, about 15 GiB free)
 
 ```bash
 nvidia-smi
 python -m pytest serve/rl/tests/test_engine_gpu.py -v -s 2>&1 | tee baseline/results/sparsespec_checks/engine_gpu_tests.log
 ```
 
-One small engine (default share 0.25, `SPARSESPEC_TEST_MEM_FRACTION` to change) runs: greedy vs HF, the
+One small engine (default share 0.25, `SPARSESPEC_TEST_MEM_FRACTION` to change; the module skips itself
+if less than share + 5 GiB is free) runs: greedy vs HF, the
 response contract around the speculation stride, log-prob agreement with the trainer forward, RNG stream
 continuity and isolation, in-place bitwise reload, sleep/wake with CUDA graphs (memory freed, identical
 greedy output after two cycles), KV pool clean after generate. The first run compiles the triton and

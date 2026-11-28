@@ -42,13 +42,16 @@ Numbers to fill in on the box (leave blank until measured):
 
 | Check | Result |
 |---|---|
-| `python -m pytest serve/rl/tests -q` (local: torch 2.15.0, transformers 5.24.1, numpy 1.26.4, verl 0.5.0) | 427 passed, 1 skipped (the GPU module) |
-| Same suite before the review fixes, on a box-like overlay (torch 2.7.1, transformers 4.57.1 and 4.51.3) | 415 passed, 1 skipped; not re-run on the overlay after the fixes |
+| `python -m pytest serve/rl/tests integration/gates/tests -q` (local: torch 2.15.0, transformers 5.24.1, numpy 1.26.4, verl 0.5.0) | 477 passed, 2 skipped (the GPU module; one test that needs `datasets`, which does not import in the local venv) |
+| Same command on a box-like overlay (torch 2.7.1, transformers 4.57.1, numpy 1.26.4, verl 0.5.0) | 477 passed, 2 skipped |
+| `serve/rl/tests` on transformers 4.51.3 (oldest release with Qwen3), before the review fixes | 415 passed, 1 skipped; not re-run after the fixes |
 | `integration/verl-0.5.0-sparsespec.patch` against the pristine verl 0.5.0 wheel | applies with `git apply` and `patch -p1`, both files compile, reverse-applies |
 | `DRY_RUN=1 bash baseline/run_seed_sparsespec.sh` composed with verl's real hydra config | composes; differs from `run_seed.sh` only in `actor_rollout_ref.rollout.*`, experiment name and checkpoint dir |
 | verl metrics path: sharding manager timing -> patched trainer statement -> console line -> `baseline/parse_timing.py` | every `sparsespec/*` column parsed with the right value |
 | Rollout output vs a verbatim copy of the tail of `vLLMRollout.generate_sequences` | identical keys, shapes, dtypes, padding, masks, position ids |
-| Gate scripts with `--engine reference` on a tiny random Qwen3 | see "Gate scripts" below |
+| Gate 3b script, `--engine reference`, tiny random Qwen3 on CPU | same weights: PASS (14/16 identical, 2 near-ties, largest margin 0.06 logits); HF given a 2%-noise checkpoint instead: FAIL as it should |
+| Gate 3c script, same setup, 16 prompts x 4 | PASS, 23 checks: mean \|Δ log p\| reloaded 0.0081, base after round trip 0.0072, negative control 0.318; with checkpoint = base model: FAIL as it should; seven deliberately broken engines (no-op reload, reallocated parameter, one weight off by one bf16 step, stale forward, wrong log-probs, stale state, dropped token) each caught |
+| Gate 3d checker on synthetic logs through the real `parse_timing.py` | good run PASS; missing step, unpatched trainer keys, zero reward, `accept_len_mean == 1`, NaN column each FAIL |
 | 3a: CPU transcription of the sampler arithmetic, chi-square against the exact law (20M sequences per variant) | sampler as written p = 0.44 to 0.86; three deliberately broken variants rejected with p = 0 |
 
 Review: five independent reviewers read the wrapper against upstream `serve/`, verl 0.5.0, vLLM 0.9.1 and
@@ -219,9 +222,13 @@ transfer). For a like-for-like generation time also compare `timing_s/generate_s
    `run_seed_sparsespec.sh` if you want the two arms' rollout blocks to differ by engine keys only.
 5. **Negative control at step 25.** 25 steps at lr 1e-6 may leave the checkpoint almost identical to the
    base model in bf16, in which case "the gap must be clearly larger" cannot hold for any correct
-   engine. The gate reports the model distance and a tracking coefficient for that case, but the default
-   verdict rule is the one you specified. If it fails for this reason, the numbers decide, not a
-   threshold change: rerun on step 50 or 100, or accept the tracking statistic.
+   engine. This is an estimate, not a measurement. The gate reports the model distance and a tracking
+   coefficient (about 1 if the engine's log-probs follow the checkpoint, about 0 if they follow the base
+   model). Your rule (negative-control mean > 3 x reloaded mean) is the default and unchanged; the
+   tracking coefficients are an additional check in the default verdict whenever their standard error is
+   small, and `--neg-control tracking` makes them replace the mean rule. If the mean rule fails for this
+   reason, the numbers decide, not a threshold change: rerun on step 50 or 100, or accept the tracking
+   statistic. Say if you want the tracking checks out of the default verdict.
 6. **Async scheduling.** Supporting `async_cpu=True` would recover an upstream optimization but needs
    new log-prob bookkeeping and its own gate run. Not attempted.
 7. **Tell Harrison** the env does not need the vLLM fork (keeps torch equal across arms), and that the
