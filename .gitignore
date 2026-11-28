@@ -189,3 +189,6 @@ outputs/
 
 # editable verl checkout created by integration/setup_env.sh
 integration/.verl-0.5.0/
+
+# logs written by the integration scripts
+integration/logs/

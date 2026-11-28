@@ -13,6 +13,9 @@ Nothing here needs CUDA, flashinfer or triton, and nothing stubs them:
     test_run_script                          baseline/run_seed_sparsespec.sh vs the baseline, via hydra
     test_verl_patch                          integration/verl-0.5.0-sparsespec.patch on a verl copy
     test_gpu_sources_static                  ast-level checks of engine.py / scheduler.py
+    test_admission_math                      serve/rl/memory.py admission modes (host_guard / worst_case)
+    test_offload_sim                         both modes against a transcription of upstream's offloading
+                                             policy (offload_sim.py), page by page
 
 The real engine's behaviour is covered by ``test_engine_gpu.py`` (another
 module in this directory, skipped without CUDA) on the A100 box.
@@ -568,6 +571,9 @@ SPARSESPEC_TIMING_KEYS = (
     "sparsespec/batch_size_mean",
     "sparsespec/num_offloads",
     "sparsespec/kv_util_peak",
+    "sparsespec/host_util_peak",
+    "sparsespec/inflight_cap",
+    "sparsespec/inflight_peak",
     "sparsespec/peak_mem_gb",
     "sparsespec/process_peak_alloc_gb",
     "sparsespec/process_peak_reserved_gb",
@@ -623,8 +629,91 @@ def sparsespec_branch_source() -> str:
     return code[2:]
 
 
+# ---------------------------------------------------------------------------
+# memory plans for the admission tests
+# ---------------------------------------------------------------------------
+QWEN3_06B = SimpleNamespace(  # Qwen/Qwen3-0.6B config.json, bf16, on the A100-40GB box
+    total_bytes=int(42.5e9),
+    mem_fraction=0.45,  # baseline: actor_rollout_ref.rollout.gpu_memory_utilization
+    num_layers=28,
+    hidden=1024,
+    num_heads=16,
+    num_kv_heads=8,
+    head_dim=128,
+    intermediate=3072,
+    vocab=151_936,
+    dtype_bytes=2,
+    max_prompt=1024,  # data.max_prompt_length
+    max_response=8192,  # data.max_response_length
+    spec_stride=8,
+    chunk_size=256,
+    max_batch_size=64,
+)
+
+
+def qwen3_plan(**overrides):
+    """serve.rl.memory.plan_memory for Qwen3-0.6B on the A100 at the run's settings."""
+    from serve.rl.memory import plan_memory
+
+    q = QWEN3_06B
+    per_layer = (
+        2 * q.hidden * q.num_heads * q.head_dim
+        + 2 * q.hidden * q.num_kv_heads * q.head_dim
+        + 3 * q.hidden * q.intermediate
+        + 2 * q.hidden
+        + 2 * q.head_dim
+    )
+    params = q.vocab * q.hidden + q.num_layers * per_layer + q.hidden
+    kwargs = dict(
+        total_bytes=q.total_bytes,
+        mem_fraction=q.mem_fraction,
+        weights_bytes=params * q.dtype_bytes,
+        num_layers=q.num_layers,
+        num_kv_heads=q.num_kv_heads,
+        head_dim=q.head_dim,
+        vocab_size=q.vocab,
+        hidden_size=q.hidden,
+        dtype_bytes=q.dtype_bytes,
+        max_batch_size=q.max_batch_size,
+        cuda_graph=True,
+        spec_stride=q.spec_stride,
+        chunk_size=q.chunk_size,
+    )
+    kwargs.update(overrides)
+    return plan_memory(**kwargs)
+
+
+def synthetic_plan(kv_capacity_tokens: int, cpu_capacity_tokens: int):
+    """A MemoryPlan with just the two pool sizes (all the admission math reads)."""
+    from serve.rl.memory import MemoryPlan
+
+    return MemoryPlan(
+        total_bytes=0, budget_bytes=0, weights_bytes=0, fixed_bytes=0, graph_bytes=0, per_request_bytes=0,
+        request_bytes=0, transient_bytes=0, safety_bytes=0, kv_token_bytes=1, kv_bytes=kv_capacity_tokens,
+        kv_capacity_tokens=int(kv_capacity_tokens), cpu_capacity_tokens=int(cpu_capacity_tokens),
+        cpu_pinned_bytes=int(cpu_capacity_tokens),
+    )  # fmt: skip
+
+
+def _load_offload_sim():
+    """serve/rl/tests/offload_sim.py, loaded by path (see the note on __init__.py at the top)."""
+    import importlib.util
+
+    name = "sparsespec_tests_offload_sim"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("offload_sim.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # dataclasses look their module up while the class body runs
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
 _TOOLKIT = SimpleNamespace(
     REPO_ROOT=REPO_ROOT,
+    QWEN3_06B=QWEN3_06B,
+    qwen3_plan=qwen3_plan,
+    synthetic_plan=synthetic_plan,
+    offload_sim=_load_offload_sim(),
     VOCAB=VOCAB,
     HIDDEN=HIDDEN,
     LAYERS=LAYERS,

@@ -55,7 +55,21 @@ Verdict: every sub-check must pass; thresholds are flags and are printed.
     > --neg-control-factor x reloaded mean. With ``--neg-control tracking`` the
     mean rule is only reported and the tracking coefficients (which must then
     be evaluable) decide: for checkpoints too close to the base model.
-Exit status 1 on FAIL. Outputs: ``<out-dir>/gate_c_reload_<tag>.json`` / ``.md``.
+Exit status 1 on FAIL. Outputs: ``<out-dir>/gate_c_reload_<tag>.json`` / ``.md``
+(``<tag>`` defaults to the engine name), plus ``gate_c_reload_<tag>.samples.json``
+on failure (``--save-samples``).
+
+Failure classification (JSON ``failure_class``; the verdict and exit status
+are NOT changed by it): ``null`` on PASS; ``"negative_control_underpowered"``
+when the ONLY failed check is the mean-based negative control, every other
+check (bitwise / pointer / tied / fingerprint / response contract / means /
+same range) passed, and HF(base) vs HF(checkpoint) themselves differ by no
+more than the rule demands, i.e. no engine could have satisfied it: the
+checkpoint is too close to the base model. The JSON, the markdown and the
+console then say so, with the numbers, what the tracking coefficients say,
+and the rerun command for a later checkpoint (``.../hf/global_step_50`` when
+``--ckpt`` ends in ``global_step_<N>``). ``"engine"`` for every other failure.
+``failed_checks`` lists the names of the failed checks.
 """
 
 from __future__ import annotations
@@ -66,7 +80,10 @@ import glob
 import json
 import math
 import os
+import re
+import shlex
 import sys
+import textwrap
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -183,10 +200,240 @@ def stat_line(name: str, stats: dict) -> str:
     )
 
 
+# ----------------------------------------------------------------------------
+# failure classification (does not change the verdict)
+# ----------------------------------------------------------------------------
+FAILURE_UNDERPOWERED = "negative_control_underpowered"
+FAILURE_ENGINE = "engine"
+# the mean-based negative-control rule(s): the only checks an underpowered checkpoint may fail
+MEAN_RULE_CHECKS = ("negative_control_clearly_larger",)
+# every one of these must be present AND pass before a failure may be blamed on the checkpoint
+ENGINE_CHECKS = (
+    "checkpoint_differs_from_base",
+    "build_matches_base",
+    "reload1_bitwise",
+    "reload1_tied",
+    "reload1_pointers_unchanged",
+    "reload1_base_no_longer_matches",
+    "sample_1_response_contract",
+    "reload2_bitwise_base",
+    "reload2_checkpoint_no_longer_matches",
+    "reload2_pointers_unchanged",
+    "base_fingerprint_after_roundtrip",
+    "sample_2_response_contract",
+    "reload3_bitwise",
+    "reload3_pointers_unchanged",
+    "fingerprint_F2_equals_F1",
+    "reloaded_all_finite",
+    "base_after_roundtrip_all_finite",
+    "reloaded_mean_small",
+    "base_after_roundtrip_mean_small",
+    "base_after_roundtrip_same_range",
+)
+
+
+def classify_failure(check_items, *, neg_control_mode: str, mean_rule_ok: bool, distance: float, needed: float):
+    """``(failure_class, reason)``: ``(None, ...)`` when every check passed,
+    ``(FAILURE_UNDERPOWERED, ...)`` when the gate failed ONLY on the mean-based
+    negative control and HF(base) vs HF(checkpoint) differ by no more than that
+    rule demands (``distance <= needed``: no engine could satisfy it), and
+    ``(FAILURE_ENGINE, ...)`` for every other failure. Conservative: anything
+    unexpected (a missing engine check, non-finite numbers, tracking mode) is
+    ``engine``."""
+    failed = [c["name"] for c in check_items if not c["ok"]]
+    if not failed:
+        return None, "all checks passed"
+    extra = [name for name in failed if name not in MEAN_RULE_CHECKS]
+    if extra:
+        return FAILURE_ENGINE, f"engine checks failed: {extra}"
+    if neg_control_mode != "mean":
+        return FAILURE_ENGINE, f"--neg-control {neg_control_mode}: the mean rule is not part of the verdict"
+    present = {c["name"]: c["ok"] for c in check_items}
+    missing = [name for name in ENGINE_CHECKS if name not in present]
+    if missing:
+        return FAILURE_ENGINE, f"engine checks missing from the run: {missing}"
+    if mean_rule_ok:
+        return FAILURE_ENGINE, "inconsistent: the mean rule failed as a check but holds"
+    if not (isinstance(distance, (int, float)) and math.isfinite(distance) and math.isfinite(needed)):
+        return FAILURE_ENGINE, f"checkpoint distance {distance!r} / required {needed!r} not finite"
+    if distance > needed:
+        return FAILURE_ENGINE, (
+            f"HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} > the required {common.fmt_num(needed)}: "
+            "a correct engine could have satisfied the mean rule"
+        )
+    return FAILURE_UNDERPOWERED, (
+        f"only the mean rule failed and HF(base) vs HF(checkpoint) differ by {common.fmt_num(distance)} <= the "
+        f"required {common.fmt_num(needed)}"
+    )
+
+
+def _flag_value(argv: list[str], flag: str) -> str | None:
+    value = None
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith(flag + "="):
+            value = arg[len(flag) + 1 :]
+    return value
+
+
+def _set_flag(argv: list[str], flag: str, value: str) -> list[str]:
+    """``argv`` with every ``flag VALUE`` / ``flag=VALUE`` replaced by ``flag value`` (appended if absent)."""
+    out: list[str] = []
+    found = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == flag:
+            if not found:
+                out += [flag, value]
+            found = True
+            i += 2
+            continue
+        if arg.startswith(flag + "="):
+            if not found:
+                out += [flag, value]
+            found = True
+            i += 1
+            continue
+        out.append(arg)
+        i += 1
+    if not found:
+        out += [flag, value]
+    return out
+
+
+def next_checkpoint(ckpt_dir: str) -> dict | None:
+    """The next checkpoint to try when ``ckpt_dir`` ends in ``global_step_<N>``:
+    step 50 for N < 50, step 100 for N < 100 (verl saves every 25 steps of a
+    100-step run); None otherwise."""
+    path = os.path.normpath(ckpt_dir)
+    match = re.fullmatch(r"global_step_(\d+)", os.path.basename(path))
+    if not match:
+        return None
+    step = int(match.group(1))
+    nxt = 50 if step < 50 else 100 if step < 100 else None
+    if nxt is None:
+        return None
+    new_dir = os.path.join(os.path.dirname(path), f"global_step_{nxt}")
+    return {"step": step, "next_step": nxt, "dir": new_dir, "exists": os.path.isdir(new_dir)}
+
+
+def next_tag(tag: str, step: int, nxt: int) -> str:
+    """``sparsespec_step25`` -> ``sparsespec_step50``; a tag without the step number gets ``_step<next>``."""
+    pattern = re.compile(rf"(step_?){step}(?!\d)")
+    if pattern.search(tag):
+        return pattern.sub(lambda m: f"{m.group(1)}{nxt}", tag, count=1)
+    return f"{tag}_step{nxt}"
+
+
+GENERIC_RERUN_HINT = (
+    "rerun the same command with --ckpt pointing at a later checkpoint of the same training run "
+    "(e.g. .../hf/global_step_50 instead of .../hf/global_step_25) and a new --tag"
+)
+
+
+def rerun_commands(raw_argv: list[str], args, ckpt_dir: str, tag: str) -> dict:
+    """Commands (repo root, PYTHONPATH=repo) that repeat this gate on a later checkpoint."""
+    nxt = next_checkpoint(ckpt_dir)
+    if nxt is None:
+        return {"next_step": None, "next_ckpt": None, "next_ckpt_exists": None, "commands": [], "hint": GENERIC_RERUN_HINT}
+    argv = _set_flag(list(raw_argv), "--ckpt", nxt["dir"])
+    argv = _set_flag(argv, "--tag", next_tag(tag, nxt["step"], nxt["next_step"]))
+    commands = []
+    if args.vllm_reference:
+        # the stock-vLLM numbers were measured on the old checkpoint: measure them again on the new one
+        ref_dir = os.path.dirname(os.path.abspath(os.path.expanduser(args.vllm_reference)))
+        ref_tag = f"step{nxt['next_step']}"
+        ref_argv = ["python", "integration/gates/gate_c_vllm_reference.py", "--ckpt", nxt["dir"], "--tag", ref_tag,
+                    "--out-dir", ref_dir]  # fmt: skip
+        for flag in ("--num-prompts", "--n", "--max-new-tokens", "--prompt-seed", "--data", "--prompts-file"):
+            value = _flag_value(raw_argv, flag)
+            if value is not None:
+                ref_argv += [flag, value]
+        commands.append({"env": "verl-baseline", "argv": ref_argv, "command": shlex.join(ref_argv)})
+        argv = _set_flag(argv, "--vllm-reference", os.path.join(ref_dir, f"gate_c_vllm_reference_{ref_tag}.json"))
+    gate_argv = ["python", "-m", "integration.gates.gate_c_reload"] + argv
+    env = "verl-sparsespec" if args.engine == "sparsespec" else "verl-sparsespec-dev or verl-sparsespec"
+    commands.append({"env": env, "argv": gate_argv, "command": shlex.join(gate_argv)})
+    hint = (
+        f"same command with --ckpt {nxt['dir']}"
+        + ("" if nxt["exists"] else " (that directory does not exist yet: wait for the training run to save it)")
+    )
+    return {"next_step": nxt["next_step"], "next_ckpt": nxt["dir"], "next_ckpt_exists": nxt["exists"],
+            "commands": commands, "hint": hint}  # fmt: skip
+
+
+def underpowered_explanation(*, stats, weights_diff, needed, distance, args, tracking, tracking_evaluable, rerun) -> str:
+    """The paragraph that goes into the console, the markdown and the JSON."""
+    fmt = common.fmt_num
+    reloaded, negative = stats["reloaded"], stats["negative_control"]
+    track_1, track_2 = tracking["sample_1"], tracking["sample_2"]
+    text = (
+        f"The gate FAILED only because the checkpoint is too close to the base model for the "
+        f"{fmt(args.neg_control_factor)}x mean rule to have power; this is not an engine failure, and the default "
+        "verdict (FAIL, exit status 1) is unchanged. Every engine check passed: bitwise reload, parameter pointers, "
+        "tied weights, greedy fingerprints, response contract, the reloaded / base_after_roundtrip means and their "
+        "same-range rule. The only failed check is negative_control_clearly_larger: it needs engine(base) vs "
+        f"HF(checkpoint) mean |delta log p| ({fmt(negative['mean'])}) to exceed {fmt(args.neg_control_factor)} x "
+        f"max(reloaded mean {fmt(reloaded['mean'])}, noise floor {args.noise_floor:g}) = {fmt(needed)}, but HF(base) "
+        f"and HF(checkpoint) themselves differ by only {fmt(distance)} on the same sequences "
+        f"({100 * weights_diff['fraction_changed']:.3f}% of bf16 weights changed: {weights_diff['num_changed']:,} of "
+        f"{weights_diff['num_elements']:,}), so no engine, however correct, could pass it. "
+        f"Tracking coefficients (0 = the engine's log-probs follow the base model, 1 = they follow the checkpoint): "
+        f"{fmt(track_1['beta'])} +/- {fmt(track_1['se'])} after reload 1 (checkpoint weights) and "
+        f"{fmt(track_2['beta'])} +/- {fmt(track_2['se'])} after reload 2 (base weights); "
+    )
+    if tracking_evaluable:
+        text += (
+            f"their standard errors are within --tracking-max-se={args.tracking_max_se:g}, so they were part of the "
+            "verdict and passed (> 0.5 after reload 1, < 0.5 after reload 2): the engine follows whichever weights "
+            "it holds. "
+        )
+    else:
+        text += (
+            f"NOT evaluable (standard errors above --tracking-max-se={args.tracking_max_se:g}, or undefined), so on "
+            "these samples that statistic cannot tell the two models apart either: it neither confirms nor "
+            "contradicts the reload. "
+        )
+    if rerun["commands"]:
+        text += (
+            f"Rerun the gate on the step-{rerun['next_step']} checkpoint, which is further from the base model: "
+            + " ; then ".join(c["command"] for c in rerun["commands"])
+            + ("" if rerun["next_ckpt_exists"] else f" ({rerun['next_ckpt']} does not exist yet)")
+            + "."
+        )
+    else:
+        text += f"To get a decisive negative control, {rerun['hint']}."
+    return text
+
+
 def build_markdown(out: dict) -> str:
     cfg, stats, ckpt = out["config"], out["stats"], out["checkpoint"]
     diff = out["checkpoint_vs_base"]
     track = out["tracking"]
+    failure_lines: list[str] = []
+    if out.get("failure_class") == FAILURE_UNDERPOWERED:
+        rerun = out.get("rerun") or {}
+        failure_lines = [
+            "## Failure class: `negative_control_underpowered` (checkpoint too close to the base model)",
+            "",
+            out["failure_explanation"],
+            "",
+        ]
+        if rerun.get("commands"):
+            failure_lines += [f"Rerun on the step-{rerun['next_step']} checkpoint (repo root, `PYTHONPATH=$PWD`):", "", "```bash"]
+            for command in rerun["commands"]:
+                failure_lines += [f"# env: {command['env']}", command["command"]]
+            failure_lines += ["```", ""]
+        else:
+            failure_lines += [f"Rerun: {rerun.get('hint', GENERIC_RERUN_HINT)}.", ""]
+    elif out.get("failure_class"):
+        failure_lines = [
+            f"Failure class: `{out['failure_class']}` ({out.get('failure_reason')}). "
+            f"Failed checks: {', '.join(f'`{n}`' for n in out.get('failed_checks', []))}",
+            "",
+        ]
     rows = [
         ("reloaded: engine(checkpoint) vs HF(checkpoint)", stats["reloaded"]),
         ("base_after_roundtrip: engine(base) vs HF(base)", stats["base_after_roundtrip"]),
@@ -199,6 +446,7 @@ def build_markdown(out: dict) -> str:
         "",
         f"**Verdict: {'PASS' if out['pass'] else 'FAIL'}**",
         "",
+        *failure_lines,
         f"- base model: `{cfg['model']}`",
         f"- checkpoint: `{ckpt['dir']}` ({ckpt['kind']})",
         f"- sampling: {cfg['num_prompts']} prompts x n={cfg['n']} = {cfg['num_prompts'] * cfg['n']} responses per sample, "
@@ -333,6 +581,7 @@ def main(argv=None) -> int:
     parser.add_argument("--tag", default=None, help="suffix of the output files (default: the engine name)")
     common.add_engine_args(parser)
     common.add_preflight_args(parser)
+    raw_argv = [str(a) for a in (sys.argv[1:] if argv is None else argv)]  # for the rerun command
     args = parser.parse_args(argv)
     tag = args.tag or args.engine
     if args.temperature <= 0:
@@ -594,12 +843,28 @@ def main(argv=None) -> int:
         }
 
     passed = checks.ok
+    failed_checks = [item["name"] for item in checks.failed]
+    failure_class, failure_reason = classify_failure(
+        checks.items, neg_control_mode=args.neg_control, mean_rule_ok=mean_rule_ok, distance=distance, needed=needed
+    )
+    failure_explanation, rerun = None, None
+    if failure_class == FAILURE_UNDERPOWERED:
+        rerun = rerun_commands(raw_argv, args, ckpt_dir, tag)
+        failure_explanation = underpowered_explanation(
+            stats=stats, weights_diff=weights_diff, needed=needed, distance=distance, args=args, tracking=tracking,
+            tracking_evaluable=tracking_evaluable, rerun=rerun,
+        )  # fmt: skip
     samples_out = {}
     for name, s in (("sample_1", sample_1), ("sample_2", sample_2)):
         samples_out[name] = {k: s[k] for k in ("weights", "finish_reasons", "engine_stats", "seconds", "num_tokens")}
     output = {
         "gate": "3c_reload",
         "pass": passed,
+        "failure_class": failure_class,
+        "failure_reason": failure_reason,
+        "failed_checks": failed_checks,
+        "failure_explanation": failure_explanation,
+        "rerun": rerun,
         "config": {
             "engine": args.engine,
             "model": base_dir,
@@ -681,7 +946,21 @@ def main(argv=None) -> int:
         return 0
     for item in checks.failed:
         common.log(f"[gate 3c] FAIL {item['name']}: {item['detail']}")
-    common.log(f"[gate 3c] FAIL ({len(checks.failed)} of {len(checks.items)} checks failed)")
+    if failure_class == FAILURE_UNDERPOWERED:
+        common.log("[gate 3c]")
+        common.log("[gate 3c] FAILURE CLASS negative_control_underpowered: the checkpoint is too close to the base model")
+        for line in textwrap.wrap(failure_explanation, 110, break_long_words=False, break_on_hyphens=False):
+            common.log(f"[gate 3c]   {line}")
+        if rerun["commands"]:
+            common.log(f"[gate 3c] rerun on the step-{rerun['next_step']} checkpoint (repo root, PYTHONPATH=$PWD):")
+            for command in rerun["commands"]:
+                common.log(f"[gate 3c]   # env {command['env']}")
+                common.log(f"[gate 3c]   {command['command']}")
+        else:
+            common.log(f"[gate 3c] rerun: {rerun['hint']}")
+    common.log(
+        f"[gate 3c] FAIL ({len(checks.failed)} of {len(checks.items)} checks failed; failure class: {failure_class})"
+    )
     return 1
 
 

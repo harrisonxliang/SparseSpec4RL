@@ -13,6 +13,21 @@ and hand the result to the SparseSpec gate (in the SparseSpec env):
 Use the SAME checkpoint, prompts (--num-prompts / --n / --prompt-seed / --data)
 and --max-new-tokens in both, otherwise the two rows are not comparable.
 
+Output files (under --out-dir, default baseline/results/sparsespec_checks/):
+  NAME = gate_c_vllm_reference           without --tag
+  NAME = gate_c_vllm_reference_<tag>     with --tag <tag> (letters, digits, '.', '_', '-')
+  <NAME>.samples.json   phase 'sample' (vLLM token ids + log-probs; --samples overrides the path)
+  <NAME>.json           phase 'score': top-level "pass" (true when every token has a finite
+                        log-prob on both sides) and stats.engine_vs_trainer, the input of
+                        gate_c_reload --vllm-reference
+  <NAME>.md             phase 'score'
+e.g. --tag step50 -> gate_c_vllm_reference_step50.json. Exit status: 0 PASS, 1 FAIL
+(non-finite or missing log-probs, or the sampling child failed: then no <NAME>.json
+is written), 128 + N if the child was killed by signal N; unusable inputs (a samples
+file from another checkpoint, mismatched lengths) stop with an error message and
+status 1. Phases 'all' and 'score' end with a line starting "[gate 3c vllm reference]"
+that contains PASS or FAIL.
+
 Phases
   sample  stock vLLM on the checkpoint (dtype bfloat16), ``SamplingParams(n=1,
           temperature=1.0, top_p=1.0, top_k=-1, max_tokens=2048, logprobs=0,
@@ -46,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -58,6 +74,12 @@ if REPO_ROOT not in sys.path:
 from integration.gates import common  # noqa: E402
 
 TEMPERATURE = 1.0
+BASE_NAME = "gate_c_vllm_reference"
+
+
+def output_name(tag: str | None) -> str:
+    """File-name stem of the outputs: ``gate_c_vllm_reference`` or ``gate_c_vllm_reference_<tag>``."""
+    return BASE_NAME + (f"_{tag}" if tag else "")
 
 
 def vllm_generate(args, ckpt_dir: str, prompts: list[list[int]]) -> dict:
@@ -183,8 +205,10 @@ def phase_score(args, ckpt_dir: str, samples_path: str, out_base: str) -> int:
         progress="vllm reference",
     )
     stats = common.compare_logprobs(logprobs, trainer)
+    passed = stats["count"] > 0 and stats["num_nonfinite"] == 0
     output = {
         "kind": "gate_c_vllm_reference",
+        "pass": passed,
         "config": {
             "ckpt": ckpt_dir,
             "num_prompts": samples["num_prompts"],
@@ -232,9 +256,11 @@ def phase_score(args, ckpt_dir: str, samples_path: str, out_base: str) -> int:
     )
     common.log(f"[vllm reference] wrote {json_path}")
     common.log(f"[vllm reference] wrote {md_path}")
-    if stats["count"] == 0 or stats["num_nonfinite"] > 0:
+    if not passed:
         common.log("[vllm reference] FAIL: non-finite or missing log-probs")
+        common.log(f"[gate 3c vllm reference] FAIL: {stats['num_nonfinite']} non-finite, {stats['count']} compared ({json_path})")
         return 1
+    common.log(f"[gate 3c vllm reference] PASS: {stats['count']} tokens compared, mean |delta log p| {common.fmt_num(stats['mean'])} ({json_path})")
     return 0
 
 
@@ -256,14 +282,20 @@ def main(argv=None) -> int:
     parser.add_argument("--score-token-budget", type=int, default=8192)
     parser.add_argument("--samples", default=None, help="samples JSON (default: <out-dir>/<name>.samples.json)")
     parser.add_argument("--out-dir", default=common.DEFAULT_OUT_DIR)
-    parser.add_argument("--tag", default=None, help="suffix of the output files")
+    parser.add_argument(
+        "--tag", default=None,
+        help="suffix of the output files: gate_c_vllm_reference_<tag>.{json,md,samples.json} (default: no suffix, "
+        "gate_c_vllm_reference.{json,md,samples.json}); letters, digits, '.', '_', '-'",
+    )  # fmt: skip
     common.add_preflight_args(parser)
     args = parser.parse_args(argv)
 
+    if args.tag is not None and not re.fullmatch(r"[A-Za-z0-9._-]+", args.tag):
+        parser.error(f"--tag {args.tag!r}: use letters, digits, '.', '_' and '-' only (it becomes part of a file name)")
     ckpt_dir = os.path.abspath(os.path.expanduser(args.ckpt))
     if not os.path.isdir(ckpt_dir):
         raise SystemExit(f"checkpoint directory not found: {ckpt_dir}")
-    name = "gate_c_vllm_reference" + (f"_{args.tag}" if args.tag else "")
+    name = output_name(args.tag)
     out_base = os.path.join(args.out_dir, name)
     samples_path = os.path.abspath(os.path.expanduser(args.samples)) if args.samples else out_base + ".samples.json"
 
@@ -289,7 +321,9 @@ def main(argv=None) -> int:
     status = subprocess.run(child).returncode
     if status != 0:
         common.log(f"[vllm reference] FAIL: the sampling process exited with status {status}")
-        return status or 1
+        common.log(f"[gate 3c vllm reference] FAIL: phase 'sample' (stock vLLM) exited with status {status}; no {name}.json")
+        # a negative status means the child was killed by a signal: report it as a crash, not as FAIL
+        return 128 - status if status < 0 else status
     return phase_score(args, ckpt_dir, samples_path, out_base)
 
 

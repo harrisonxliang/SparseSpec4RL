@@ -16,6 +16,9 @@ What is in here:
                  verl's actor does (``dp_actor._forward_micro_batch``);
                  ``hf_greedy`` / ``hf_teacher_forced_logits`` for the greedy gate.
 * statistics     ``compare_logprobs``, ``tracking_coefficient``.
+* gate 3b files  ``greedy_tokens_record`` / ``read_greedy_tokens`` (one token-file
+                 schema for the engine, HF and stock-vLLM sides),
+                 ``describe_prompt_mismatch``.
 * reporting      ``Checks``, ``write_json``, ``write_text``, ``md_table``.
 * shared box     ``gpu_preflight`` (nvidia-smi; refuses to start, never kills).
 """
@@ -394,15 +397,17 @@ def check_responses(result, max_new_tokens: int, eos_ids, *, greedy: bool = Fals
     Per response: non-empty, at most ``max_new_tokens`` tokens, either ends
     with the first EOS it contains or has exactly ``max_new_tokens`` tokens,
     one finite log-prob <= 0 per token (exactly 0.0 when greedy), and a
-    finish reason that matches.
+    finish reason that matches. ``result.logprobs`` may be None (generated
+    with ``return_logprobs=False``): the log-prob checks are then skipped.
     """
     eos = set(int(t) for t in eos_ids)
     problems: list[str] = []
-    for i, (tokens, logprobs, reason) in enumerate(zip(result.token_ids, result.logprobs, result.finish_reasons)):
+    all_logprobs = result.logprobs if result.logprobs is not None else [None] * len(result.token_ids)
+    for i, (tokens, logprobs, reason) in enumerate(zip(result.token_ids, all_logprobs, result.finish_reasons)):
         if len(tokens) == 0:
             problems.append(f"response {i}: empty")
             continue
-        if len(tokens) != len(logprobs):
+        if logprobs is not None and len(tokens) != len(logprobs):
             problems.append(f"response {i}: {len(tokens)} tokens but {len(logprobs)} log-probs")
         if len(tokens) > max_new_tokens:
             problems.append(f"response {i}: {len(tokens)} tokens > max_new_tokens={max_new_tokens}")
@@ -417,12 +422,14 @@ def check_responses(result, max_new_tokens: int, eos_ids, *, greedy: bool = Fals
                 problems.append(f"response {i}: no EOS and {len(tokens)} != max_new_tokens={max_new_tokens}")
             if reason != "length":
                 problems.append(f"response {i}: no EOS but finish_reason={reason!r}")
+        if logprobs is None:
+            continue
         bad = [x for x in logprobs if not math.isfinite(x) or x > 0.0]
         if bad:
             problems.append(f"response {i}: {len(bad)} log-prob(s) not finite or > 0, e.g. {bad[0]!r}")
         if greedy and any(x != 0.0 for x in logprobs):
             problems.append(f"response {i}: greedy log-probs must be exactly 0.0")
-    if not (len(result.token_ids) == len(result.logprobs) == len(result.finish_reasons)):
+    if not (len(result.token_ids) == len(all_logprobs) == len(result.finish_reasons)):
         problems.append("token_ids / logprobs / finish_reasons have different lengths")
     return problems
 
@@ -442,6 +449,138 @@ def first_difference(a: Sequence[int], b: Sequence[int]) -> int:
         if x != y:
             return i
     return -1 if len(a) == len(b) else min(len(a), len(b))
+
+
+# ----------------------------------------------------------------------------
+# greedy token files (gate 3b): one schema for the engine, HF and stock-vLLM sides
+# ----------------------------------------------------------------------------
+GREEDY_TOKENS_KIND = "gate_b_greedy_tokens"
+GREEDY_TOKENS_FORMAT = 1
+GREEDY_SIDES = ("engine", "hf", "vllm")
+# per-step arrays that a side may carry; each has one entry per response token
+GREEDY_STEP_ARRAYS = ("logprobs", "sampled_logprobs", "sampled_ranks", "top2_token_ids", "top2_logprobs", "margins")
+
+
+class GreedyFileError(ValueError):
+    """A gate 3b token file is missing, malformed or internally inconsistent."""
+
+
+def prompts_sha256(prompts: Sequence[Sequence[int]]) -> str:
+    """Hash that identifies a prompt set (sha256 of the compact JSON of the token-id lists)."""
+    return fingerprint(prompts)
+
+
+def greedy_tokens_record(
+    *,
+    side: str,
+    engine: str,
+    model: str,
+    prompts: Sequence[Sequence[int]],
+    prompts_meta: dict | None,
+    token_ids: Sequence[Sequence[int]],
+    finish_reasons: Sequence[str],
+    max_new_tokens: int,
+    eos_token_ids: Sequence[int],
+    **extra,
+) -> dict:
+    """The JSON object of one side of the greedy comparison (see ``read_greedy_tokens``)."""
+    if side not in GREEDY_SIDES:
+        raise ValueError(f"side must be one of {GREEDY_SIDES}, got {side!r}")
+    record = {
+        "kind": GREEDY_TOKENS_KIND,
+        "format_version": GREEDY_TOKENS_FORMAT,
+        "side": side,
+        "engine": engine,
+        "model": model,
+        "temperature": 0.0,
+        "max_new_tokens": int(max_new_tokens),
+        "eos_token_ids": sorted(int(t) for t in eos_token_ids),
+        "num_prompts": len(prompts),
+        "prompts_sha256": prompts_sha256(prompts),
+        "prompts_meta": prompts_meta,
+        "prompts": [[int(t) for t in p] for p in prompts],
+        "token_ids": [[int(t) for t in row] for row in token_ids],
+        "finish_reasons": list(finish_reasons),
+    }
+    record.update(extra)
+    return record
+
+
+def _is_int_list(row) -> bool:
+    return isinstance(row, list) and all(isinstance(t, int) and not isinstance(t, bool) for t in row)
+
+
+def read_greedy_tokens(path: str, *, side: str | None = None) -> dict:
+    """Load and validate a gate 3b token file (written by ``greedy_tokens_record``).
+
+    Raises ``GreedyFileError`` naming the file and the first problem found:
+    wrong kind / format / side, prompts that do not match their own stored
+    hash (the file was edited or truncated), or per-prompt / per-step arrays
+    of the wrong length.
+    """
+    where = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(where):
+        raise GreedyFileError(f"{where}: file not found")
+    try:
+        with open(where) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise GreedyFileError(f"{where}: not valid JSON ({exc})") from exc
+    if not isinstance(data, dict) or data.get("kind") != GREEDY_TOKENS_KIND:
+        found = data.get("kind") if isinstance(data, dict) else type(data).__name__
+        raise GreedyFileError(f"{where}: not a gate 3b token file (kind={found!r}, expected {GREEDY_TOKENS_KIND!r})")
+    if data.get("format_version") != GREEDY_TOKENS_FORMAT:
+        raise GreedyFileError(
+            f"{where}: format_version {data.get('format_version')!r}, this code reads {GREEDY_TOKENS_FORMAT}"
+        )
+    if side is not None and data.get("side") != side:
+        raise GreedyFileError(f"{where}: holds the {data.get('side')!r} side, expected {side!r}")
+    for key in ("prompts", "token_ids", "finish_reasons", "prompts_sha256", "max_new_tokens", "eos_token_ids"):
+        if key not in data:
+            raise GreedyFileError(f"{where}: missing key {key!r}")
+    prompts, tokens = data["prompts"], data["token_ids"]
+    if not isinstance(prompts, list) or not prompts or not all(_is_int_list(p) and p for p in prompts):
+        raise GreedyFileError(f"{where}: 'prompts' must be a non-empty list of non-empty token-id lists")
+    if prompts_sha256(prompts) != data["prompts_sha256"]:
+        raise GreedyFileError(
+            f"{where}: the stored prompts do not match the stored prompts_sha256 (file edited or corrupted)"
+        )
+    if not isinstance(tokens, list) or len(tokens) != len(prompts) or not all(_is_int_list(r) for r in tokens):
+        raise GreedyFileError(f"{where}: 'token_ids' must hold one token-id list per prompt ({len(prompts)})")
+    if not isinstance(data["finish_reasons"], list) or len(data["finish_reasons"]) != len(prompts):
+        raise GreedyFileError(f"{where}: 'finish_reasons' must hold one entry per prompt ({len(prompts)})")
+    for key in GREEDY_STEP_ARRAYS:
+        if key not in data:
+            continue
+        rows = data[key]
+        if not isinstance(rows, list) or len(rows) != len(prompts):
+            raise GreedyFileError(f"{where}: {key!r} must hold one list per prompt ({len(prompts)})")
+        for i, (row, toks) in enumerate(zip(rows, tokens)):
+            if not isinstance(row, list) or len(row) != len(toks):
+                raise GreedyFileError(
+                    f"{where}: {key!r} of prompt {i} has {len(row) if isinstance(row, list) else '?'} entries for "
+                    f"{len(toks)} response tokens"
+                )
+    return data
+
+
+def describe_prompt_mismatch(expected: Sequence[Sequence[int]], actual: Sequence[Sequence[int]]) -> str | None:
+    """None if the two prompt sets are identical (hash and exact ids), else where they first differ."""
+    expected = [list(p) for p in expected]
+    actual = [list(p) for p in actual]
+    if prompts_sha256(expected) == prompts_sha256(actual) and expected == actual:
+        return None
+    head = f"sha256 {prompts_sha256(expected)[:16]}... vs {prompts_sha256(actual)[:16]}..."
+    if len(expected) != len(actual):
+        return f"{len(expected)} prompts vs {len(actual)} prompts ({head})"
+    for i, (a, b) in enumerate(zip(expected, actual)):
+        if a != b:
+            j = first_difference(a, b)
+            return (
+                f"prompt {i} differs at token {j} (lengths {len(a)} vs {len(b)}; "
+                f"ids {a[j] if j < len(a) else 'end'} vs {b[j] if j < len(b) else 'end'}) ({head})"
+            )
+    return f"same ids but different hashes ({head})"  # unreachable unless fingerprint changes
 
 
 # ----------------------------------------------------------------------------

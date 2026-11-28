@@ -574,9 +574,11 @@ def test_stats_have_exactly_the_shared_keys(tk, engine, prompts):
 
     # no speculation in the reference engine: everything about acceptance / KV offload is zero
     for key in ("num_cycles", "draft_tokens", "accepted_draft_tokens", "accept_len_mean", "accept_rate",
-                "num_offloads", "kv_util_peak"):  # fmt: skip
+                "num_offloads", "kv_util_peak", "host_util_peak"):  # fmt: skip
         assert stats[key] == 0.0, key
     assert stats["peak_mem_gb"] == 0.0  # CPU
+    # no admission policy: every micro-batch of max_batch_size runs at once
+    assert stats["inflight_cap"] == 8.0 and stats["inflight_peak"] == 8.0
 
     assert stats["num_requests"] == len(prompts)
     assert stats["num_tokens"] == sum(len(t) for t in result.token_ids)
@@ -588,6 +590,7 @@ def test_stats_have_exactly_the_shared_keys(tk, engine, prompts):
     greedy = engine.generate(prompts[:3], 5, temperature=0.0, eos_token_ids=[tk.VOCAB - 1])
     assert greedy.stats["num_requests"] == 3.0 and greedy.stats["num_tokens"] == 15.0
     assert greedy.stats["num_iters"] == 5.0 and greedy.stats["batch_size_mean"] == 3.0
+    assert greedy.stats["inflight_cap"] == 8.0 and greedy.stats["inflight_peak"] == 3.0
     assert result.stats["num_requests"] == len(prompts)  # an earlier result is not rewritten
 
 
@@ -601,3 +604,29 @@ def test_early_stop_ends_the_batch_early(tk, tiny_model):
     assert result.token_ids == [tk.cut_at_eos(row, eos) for row in greedy]
     assert result.finish_reasons == ["stop"] * 3
     assert result.stats["num_iters"] <= 2.0
+
+
+# ---------------------------------------------------------------------------
+# return_logprobs=False
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("temperature", [1.0, 0.7, 0.0])
+def test_return_logprobs_false_gives_the_same_tokens_without_logprobs(tk, tiny_model, prompts, temperature):
+    with_lps = tk.make_reference_engine(tiny_model, seed=5)
+    without = tk.make_reference_engine(tiny_model, seed=5)
+    for _ in range(2):  # the sampling stream advances the same way with and without log-probs
+        a = with_lps.generate(prompts, MAX_NEW, temperature=temperature, eos_token_ids=WIDE_EOS)
+        b = without.generate(prompts, MAX_NEW, temperature=temperature, eos_token_ids=WIDE_EOS, return_logprobs=False)
+        assert b.logprobs is None
+        assert b.token_ids == a.token_ids and b.finish_reasons == a.finish_reasons
+        assert a.logprobs is not None and [len(lp) for lp in a.logprobs] == [len(t) for t in a.token_ids]
+        # the statistics have the same shape (keys, types) and the same values apart from the timing
+        assert list(b.stats) == list(a.stats) == list(STAT_KEYS)
+        assert all(type(v) is float for v in b.stats.values())
+        assert {k: v for k, v in b.stats.items() if k != "gen_s"} == {k: v for k, v in a.stats.items() if k != "gen_s"}
+    check_contract(a, len(prompts), MAX_NEW, WIDE_EOS, tk.VOCAB)
+
+
+def test_return_logprobs_is_keyword_only_and_defaults_to_true(tk, engine, prompts):
+    parameter = inspect.signature(ReferenceEngine.generate).parameters["return_logprobs"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is True
+    assert engine.generate(prompts[:2], 3, temperature=0.0).logprobs == [[0.0] * 3, [0.0] * 3]

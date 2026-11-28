@@ -253,6 +253,7 @@ class ReferenceEngine(RolloutEngine):
         top_k: int = -1,
         *,
         eos_token_ids=None,
+        return_logprobs: bool = True,
     ) -> GenerationResult:
         self._require_open()
         if self._sleeping:
@@ -287,10 +288,14 @@ class ReferenceEngine(RolloutEngine):
         forwards = 0
         rows = 0
         cursor = 0
+        batch_limit = 0  # largest micro-batch the memory share allowed
+        batch_peak = 0  # largest micro-batch actually run
         while cursor < len(order):
             size = self._micro_batch_size(len(prompts[order[cursor]]), max_new_tokens)
             chunk = order[cursor : cursor + size]
             cursor += size
+            batch_limit = max(batch_limit, size)
+            batch_peak = max(batch_peak, len(chunk))
             toks, lps, n_fwd = self._generate_batch(
                 [prompts[i] for i in chunk], max_new_tokens, float(temperature), eos_set
             )
@@ -329,7 +334,14 @@ class ReferenceEngine(RolloutEngine):
                 peak / 1024**3,
                 peak_reserved / 1024**3,
             )
-        return GenerationResult(token_ids=token_ids, logprobs=logprobs, finish_reasons=reasons, stats=stats)
+        stats["inflight_cap"] = float(batch_limit)
+        stats["inflight_peak"] = float(batch_peak)
+        return GenerationResult(
+            token_ids=token_ids,
+            logprobs=logprobs if return_logprobs else None,
+            finish_reasons=reasons,
+            stats=stats,
+        )
 
     # ------------------------------------------------------------------
     def memory_report(self) -> dict:

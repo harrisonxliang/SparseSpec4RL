@@ -35,11 +35,27 @@ or sampled:
    tokens were generated, and looks at the last PROMPT token while a prompt
    is still being chunk-prefilled.
 
-3. Admission control that cannot exhaust the KV pools: a request is admitted
-   only if the worst-case KV demand of everything in flight still fits in
-   GPU pool + host offload pool (upstream would hit ``alloc_page_cpu``'s
-   "Out of memory" assertion), and only when the GPU pool has room to finish
-   prefilling it without an offload in between.
+3. Admission control that cannot exhaust the KV pools (upstream would hit
+   ``alloc_page_cpu``'s "Out of memory" assertion), in two modes:
+
+   * ``worst_case`` (default): a request is admitted only if the worst-case
+     KV demand of everything in flight (every request running to its length
+     limit) still fits in GPU pool + host offload pool;
+   * ``host_guard``: admit on current free capacity like upstream, but never
+     more requests in flight than the host pool can absorb under upstream's
+     own offload rules (shortest victim first, last offloaded restored
+     first, no admission while anything is offloaded). The bound is
+     ``serve.rl.memory.host_guard_host_bound``; it is a fixed in-flight cap
+     per ``generate`` call, so no request is ever dropped, restarted or
+     truncated, only admitted later.
+
+   In both modes a request is admitted only in a scheduler call that starts
+   with nothing offloaded, and only when the GPU pool has room to finish
+   prefilling it without an offload in between. (Upstream may restore the
+   last offloaded request and admit a new one in the same call; the room
+   check would then be measured before the restore took its pages, so
+   admission waits one iteration instead.) A request that is still
+   prefilling is therefore never the offload victim.
 
 4. Per-call statistics (verify cycles, acceptance, batch size, offloads).
 """
@@ -74,11 +90,30 @@ class SchedulerStats:
     sum_active: int = 0  # sum over forward passes of the number of active requests
     num_offloads: int = 0  # requests pushed to the host offload pool
     peak_kv_used: int = 0  # peak number of GPU KV pages in use
+    peak_host_used: int = 0  # peak number of host offload pages in use
+    peak_inflight: int = 0  # most requests in flight at once (active + offloaded)
 
 
 class RLSpecScheduler(SpecScheduler):
-    def __init__(self, kv_pool, model, *, total_token_capacity: int, **job_args):
+    def __init__(
+        self,
+        kv_pool,
+        model,
+        *,
+        total_token_capacity: int,
+        admission: str = "worst_case",
+        inflight_cap: int | None = None,
+        collect_logprobs: bool = True,
+        **job_args,
+    ):
         super().__init__(kv_pool=kv_pool, model=model, **job_args)
+        if admission not in ("worst_case", "host_guard"):
+            raise ValueError(f"admission must be 'worst_case' or 'host_guard', got {admission!r}")
+        if admission == "host_guard" and (inflight_cap is None or inflight_cap < 1):
+            raise ValueError("host_guard admission needs inflight_cap >= 1")
+        self._rl_admission = admission
+        self._rl_inflight_cap = inflight_cap
+        self._rl_collect_logprobs_on = bool(collect_logprobs)
         if self.async_on:
             raise NotImplementedError(
                 "RLSpecScheduler supports synchronous scheduling only (async_cpu=False): in async mode "
@@ -103,7 +138,13 @@ class RLSpecScheduler(SpecScheduler):
         return request_token_need(request.len_input, request.len_output + 1, self.spec_stride)
 
     def _rl_may_admit(self, request: Request) -> bool:
-        if self._rl_committed + self._rl_need(request) > self._rl_total_capacity:
+        if self._rl_admission == "host_guard":
+            # Upstream only admits while nothing is offloaded, so this counts
+            # the running requests; the cap bounds what they can ever push to
+            # the host pool (see the module docstring).
+            if len(self.active_requests) + len(self.offload_requests) + 1 > self._rl_inflight_cap:
+                return False
+        elif self._rl_committed + self._rl_need(request) > self._rl_total_capacity:
             return False
         if not self.active_requests and not self.offload_requests:
             # Nothing in flight: the whole GPU pool is free. The engine checked
@@ -122,7 +163,10 @@ class RLSpecScheduler(SpecScheduler):
 
     def admit_requests(self, pending_requests) -> None:
         head = pending_requests[0] if pending_requests else None
-        allow = head is not None and self._rl_may_admit(head)
+        # Not while anything is offloaded at the start of the call: upstream
+        # would first restore the top of the stack (up to 1024 GPU pages that
+        # _rl_may_admit has not seen) and could then admit in the same call.
+        allow = head is not None and not self.offload_requests and self._rl_may_admit(head)
         offloaded_before = len(self.offload_requests)
         # With an empty list upstream still runs its offload / restore logic
         # but cannot admit anything.
@@ -133,16 +177,29 @@ class RLSpecScheduler(SpecScheduler):
             self._rl_committed += head._rl_need
             head.rl_logprobs = []
             head.rl_finish_reason = None
+        in_flight = len(self.active_requests) + len(self.offload_requests)
+        if in_flight > self.rl.peak_inflight:
+            self.rl.peak_inflight = in_flight
+        host_used = self.kv_pool._MAX_CPU_CAPACITY - len(self.kv_pool._free_cpu)
+        if host_used > self.rl.peak_host_used:
+            self.rl.peak_host_used = host_used
 
     def add_request(self, request: Request, is_restore: bool = False) -> None:
         if is_restore and request.status == _NORMAL:
-            # Upstream asserts an offloaded request is never in NORMAL state,
-            # but its own victim selection (shortest active request) can pick
-            # a request that is still prefilling. The admission margin above
-            # makes that unlikely; if it happens anyway, resuming prefill
-            # after the restore is well defined, so do not crash a training
-            # run over it.
-            logger.warning("restoring an offloaded request that is still prefilling")
+            # Safety net only. Upstream asserts an offloaded request is never
+            # in NORMAL state, although its victim selection (shortest active
+            # request) could pick one that is still prefilling. The admission
+            # rule in admit_requests keeps that from happening (a request is
+            # admitted with room to finish its prefill before any offload).
+            # If it happens anyway, resuming prefill is safe for prompts up
+            # to 1025 tokens (one restore step); do not crash a run over it,
+            # but say so loudly.
+            logger.warning(
+                "restoring an offloaded request that is still prefilling (prompt %d tokens, %d in KV): "
+                "the admission invariant was broken; please report this",
+                request.len_input,
+                request.len_kv_cache,
+            )
             self.active_requests.append(request)
             return
         super().add_request(request, is_restore=is_restore)
@@ -223,7 +280,7 @@ class RLSpecScheduler(SpecScheduler):
         for request in completed:
             self._rl_committed -= request._rl_need
             num_response = request.len_token_ids - request.len_input
-            if len(request.rl_logprobs) != num_response:
+            if self._rl_collect_logprobs_on and len(request.rl_logprobs) != num_response:
                 raise RuntimeError(
                     f"request {getattr(request, 'request_id', '?')}: {num_response} response tokens but "
                     f"{len(request.rl_logprobs)} target log-probs"
@@ -232,6 +289,9 @@ class RLSpecScheduler(SpecScheduler):
 
     def _rl_collect_logprobs(self, normal_jobs, gen_token_probs_gpu) -> None:
         """One GPU gather + one D2H copy for every token confirmed this pass."""
+        if not self._rl_collect_logprobs_on:
+            self.rl.normal_tokens += len(normal_jobs)
+            return
         rows: list[int] = []
         toks: list[int] = []
         for request, row in normal_jobs:

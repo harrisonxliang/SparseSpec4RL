@@ -1,6 +1,16 @@
 """GPU tests for ``serve.rl.engine.SparseSpecEngine`` (run on the A100 box).
 
-    PYTHONPATH=. python -m pytest serve/rl/tests/test_engine_gpu.py -v -s --log-cli-level=INFO
+Three invocations, from the repo root (PYTHONPATH=repo), each its own pytest
+process (``SparseSpecEngine`` allows one engine per process):
+
+    # 1) everything except the offload stress test, default admission (worst_case)
+    python -m pytest serve/rl/tests/test_engine_gpu.py -v -s --log-cli-level=INFO
+    # 2) the same with the other admission mode
+    SPARSESPEC_TEST_ADMISSION=host_guard python -m pytest serve/rl/tests/test_engine_gpu.py -v -s --log-cli-level=INFO
+    # 3) offload stress: an engine with a deliberately small GPU KV pool; runs ONLY
+    #    test_offload_stress, test_admission_stats and test_return_logprobs_false
+    #    (everything else is skipped with a reason). Combine with 2) for host_guard.
+    SPARSESPEC_TEST_OFFLOAD_STRESS=1 python -m pytest serve/rl/tests/test_engine_gpu.py -v -s --log-cli-level=INFO
 
 The whole module is SKIPPED unless CUDA is available and the custom flashinfer
 build imports (nothing is stubbed). If both are there, a failure to import
@@ -20,6 +30,15 @@ Environment variables
     SPARSESPEC_TEST_NUM_MIN_BUDGET   PillarAttn min budget (default 128, the training value)
     SPARSESPEC_TEST_TIE_MARGIN       HF logit margin that still counts as a bf16 near-tie (default 1.0)
     SPARSESPEC_TEST_MAX_MEAN_DLOGP   bound on mean |delta log p| engine vs trainer forward (default 0.05)
+    SPARSESPEC_TEST_ADMISSION        engine admission: worst_case (default) | host_guard
+    SPARSESPEC_TEST_OFFLOAD_STRESS   1 = offload stress process (see 3 above; default 0)
+  only read with SPARSESPEC_TEST_OFFLOAD_STRESS=1:
+    SPARSESPEC_TEST_KV_CAPACITY_TOKENS        GPU KV pool size (default 4096 tokens: with the defaults
+                                              below about 6 to 8 requests in flight need ~6-7.5k tokens)
+    SPARSESPEC_TEST_STRESS_NUM_REQUESTS       requests in the stress batch (default 24)
+    SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS     response length of every stress request (default 512)
+    SPARSESPEC_TEST_STRESS_MAX_RESPONSE_DLOGP bound on the worst single response's mean |delta log p|
+                                              (default 3 x SPARSESPEC_TEST_MAX_MEAN_DLOGP)
 
 The HF comparisons reuse the gate helpers (``integration/gates``): the same
 "trainer forward" and the same near-tie rule as gates 3b / 3c.
@@ -56,16 +75,39 @@ if str(REPO_ROOT) not in sys.path:
 from integration.gates import common  # noqa: E402
 from integration.gates.gate_b_greedy import analyse_prompt  # noqa: E402
 from integration.gates.make_synthetic_ckpt import perturb_state_dict  # noqa: E402
+from serve.rl import memory  # noqa: E402
 from serve.rl.base import STAT_KEYS  # noqa: E402
 
+
+def _env(name: str, default: str, cast):
+    raw = os.environ.get(name, default)
+    try:
+        return cast(raw)
+    except ValueError:
+        raise ValueError(f"environment variable {name}={raw!r} is not a valid {cast.__name__}") from None
+
+
 MODEL = os.environ.get("SPARSESPEC_TEST_MODEL", "Qwen/Qwen3-0.6B")
-MEM_FRACTION = float(os.environ.get("SPARSESPEC_TEST_MEM_FRACTION", "0.25"))
-MAX_BATCH_SIZE = int(os.environ.get("SPARSESPEC_TEST_MAX_BATCH_SIZE", "16"))
+MEM_FRACTION = _env("SPARSESPEC_TEST_MEM_FRACTION", "0.25", float)
+MAX_BATCH_SIZE = _env("SPARSESPEC_TEST_MAX_BATCH_SIZE", "16", int)
 DEVICE = os.environ.get("SPARSESPEC_TEST_DEVICE", "cuda:0")
 CUDA_GRAPH = os.environ.get("SPARSESPEC_TEST_CUDA_GRAPH", "1") != "0"
-NUM_MIN_BUDGET = int(os.environ.get("SPARSESPEC_TEST_NUM_MIN_BUDGET", "128"))
-TIE_MARGIN = float(os.environ.get("SPARSESPEC_TEST_TIE_MARGIN", "1.0"))
-MAX_MEAN_DLOGP = float(os.environ.get("SPARSESPEC_TEST_MAX_MEAN_DLOGP", "0.05"))
+NUM_MIN_BUDGET = _env("SPARSESPEC_TEST_NUM_MIN_BUDGET", "128", int)
+TIE_MARGIN = _env("SPARSESPEC_TEST_TIE_MARGIN", "1.0", float)
+MAX_MEAN_DLOGP = _env("SPARSESPEC_TEST_MAX_MEAN_DLOGP", "0.05", float)
+ADMISSION = os.environ.get("SPARSESPEC_TEST_ADMISSION", "worst_case")
+if ADMISSION not in memory.ADMISSION_MODES:
+    raise ValueError(f"SPARSESPEC_TEST_ADMISSION={ADMISSION!r}: expected one of {memory.ADMISSION_MODES}")
+OFFLOAD_STRESS = os.environ.get("SPARSESPEC_TEST_OFFLOAD_STRESS", "0") not in ("", "0")
+KV_CAPACITY_TOKENS = _env("SPARSESPEC_TEST_KV_CAPACITY_TOKENS", "4096", int)
+STRESS_NUM_REQUESTS = _env("SPARSESPEC_TEST_STRESS_NUM_REQUESTS", "24", int)
+STRESS_MAX_NEW_TOKENS = _env("SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS", "512", int)
+STRESS_MAX_RESPONSE_DLOGP = _env("SPARSESPEC_TEST_STRESS_MAX_RESPONSE_DLOGP", str(3 * MAX_MEAN_DLOGP), float)
+
+# tests that run in the offload-stress process (SPARSESPEC_TEST_OFFLOAD_STRESS=1); all others are skipped there
+STRESS_PROCESS_TESTS = ("test_offload_stress", "test_admission_stats", "test_return_logprobs_false")
+# tests that run ONLY in the offload-stress process
+STRESS_ONLY_TESTS = ("test_offload_stress",)
 
 SPEC_STRIDE = 8
 BUDGET_RATIO = 0.05
@@ -119,8 +161,14 @@ def prompts(model_dir) -> dict:
     short = [build(q) for q in QUESTIONS]
     long = [build(_long_question(k)) for k in range(3)]
     assert all(len(p) > 256 for p in long), [len(p) for p in long]
-    print(f"\n[prompts] short: {[len(p) for p in short]} tokens, long: {[len(p) for p in long]} tokens")
-    return {"short": short, "long": long}
+    # offload stress: eight distinct prompts of nearly the same length (chunked prefill, 2 chunks)
+    stress = [build(_long_question(k, terms=40)) for k in range(3, 11)]
+    assert all(len(p) > 256 for p in stress), [len(p) for p in stress]
+    print(
+        f"\n[prompts] short: {[len(p) for p in short]} tokens, long: {[len(p) for p in long]} tokens, "
+        f"stress: {[len(p) for p in stress]} tokens"
+    )
+    return {"short": short, "long": long, "stress": stress}
 
 
 @pytest.fixture(scope="module")
@@ -135,6 +183,11 @@ def engine(model_dir):
         )
     from serve.rl.engine import SparseSpecEngine  # an import error here is a real failure
 
+    extra = {"kv_capacity_tokens": KV_CAPACITY_TOKENS} if OFFLOAD_STRESS else {}
+    print(
+        f"\n[engine] admission={ADMISSION}, offload stress process: {OFFLOAD_STRESS}"
+        + (f" (kv_capacity_tokens={KV_CAPACITY_TOKENS})" if OFFLOAD_STRESS else "")
+    )
     eng = SparseSpecEngine(
         model_dir,
         mem_fraction=MEM_FRACTION,
@@ -147,7 +200,12 @@ def engine(model_dir):
         seed=0,
         dtype="bfloat16",
         device=DEVICE,
+        admission=ADMISSION,
+        **extra,
     )
+    assert eng.admission == ADMISSION
+    if OFFLOAD_STRESS:
+        assert eng.kv_pool.capacity == eng.plan.kv_capacity_tokens == KV_CAPACITY_TOKENS
     print("\n[engine] memory plan:\n" + eng.plan.describe())
     print(f"[engine] measured: {eng.memory_report()['measured']}")
     yield eng
@@ -169,6 +227,23 @@ def hf_model(model_dir, engine):
 @pytest.fixture(scope="module")
 def base_state(model_dir) -> dict:
     return common.read_state_dict(model_dir)
+
+
+@pytest.fixture(autouse=True)
+def _process_kind(request):
+    """The offload-stress process (small KV pool) runs only STRESS_PROCESS_TESTS; the
+    normal process skips STRESS_ONLY_TESTS. (The module-scoped engine may already be
+    built when this runs: pytest sets up higher-scoped fixtures first. That is the same
+    engine either way.)"""
+    name = getattr(request.node, "originalname", None) or request.node.name
+    if OFFLOAD_STRESS and name not in STRESS_PROCESS_TESTS:
+        pytest.skip(
+            f"SPARSESPEC_TEST_OFFLOAD_STRESS=1: this process has a {KV_CAPACITY_TOKENS}-token KV pool and runs only "
+            f"{', '.join(STRESS_PROCESS_TESTS)}"
+        )
+    if not OFFLOAD_STRESS and name in STRESS_ONLY_TESTS:
+        pytest.skip("needs its own pytest process: rerun with SPARSESPEC_TEST_OFFLOAD_STRESS=1 (see the module docstring)")
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -533,3 +608,230 @@ def test_stats_are_sane(engine, prompts, eos):
     assert 0.0 < stats["kv_util_peak"] <= 1.0
     assert 0.0 < stats["peak_mem_gb"] < torch.cuda.get_device_properties(torch.device(DEVICE)).total_memory / GIB
     assert stats["gen_s"] > 0.0
+
+
+# ----------------------------------------------------------------------------
+# admission statistics (both admission modes; also in the offload-stress process)
+# ----------------------------------------------------------------------------
+def _assert_pool_clean(engine, where: str) -> None:
+    pool = engine.kv_pool
+    assert pool.num_free_pages == pool.capacity, f"{where}: {pool.capacity - pool.num_free_pages} GPU KV pages still allocated"
+    assert len(set(pool._free_gpu)) == pool.capacity, f"{where}: duplicate GPU pages in the free list"
+    assert len(pool._free_cpu) == pool._MAX_CPU_CAPACITY, (
+        f"{where}: {pool._MAX_CPU_CAPACITY - len(pool._free_cpu)} host offload pages still allocated"
+    )
+    assert len(set(pool._free_cpu)) == pool._MAX_CPU_CAPACITY, f"{where}: duplicate host pages in the free list"
+    if hasattr(pool, "_cpu_page_free"):
+        assert pool._cpu_page_free.count(1) == pool._MAX_CPU_CAPACITY, f"{where}: host pages still flagged as allocated"
+
+
+def test_admission_stats(engine, prompts, eos):
+    """inflight_peak <= inflight_cap <= max_batch_size, the cap is serve.rl.memory.inflight_cap for
+    the workload, host_util_peak in [0, 1]. All prompts have the SAME length: worst_case admission
+    commits each request's own worst case, so with mixed lengths more short requests than the cap
+    (which is computed for the longest prompt) could be in flight."""
+    length = min(len(p) for p in prompts["long"])
+    batch = [p[:length] for p in prompts["long"]] * 7  # 21 requests > max_batch_size 16 by default
+    max_new_tokens = 64
+    result = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=1.0, eos_token_ids=eos)
+    stats = result.stats
+    assert not common.check_responses(result, max_new_tokens, eos)
+
+    expected = {
+        mode: memory.inflight_cap(
+            mode, engine.plan, engine.max_batch_size, engine.spec_stride, engine.chunk_size, length, max_new_tokens
+        )
+        for mode in memory.ADMISSION_MODES
+    }
+    print(
+        f"\n[admission] admission={engine.admission}: inflight_peak={stats['inflight_peak']:.0f} "
+        f"inflight_cap={stats['inflight_cap']:.0f} (worst_case {expected['worst_case']}, host_guard "
+        f"{expected['host_guard']}, max_batch_size {engine.max_batch_size}), batch_size_mean={stats['batch_size_mean']:.2f}, "
+        f"num_offloads={stats['num_offloads']:.0f}, kv_util_peak={stats['kv_util_peak']:.3f}, "
+        f"host_util_peak={stats['host_util_peak']:.3f}"
+    )
+    assert engine.admission == ADMISSION
+    assert stats["inflight_cap"] == float(expected[ADMISSION])
+    for mode in memory.ADMISSION_MODES:
+        assert engine.inflight_cap(length, max_new_tokens, mode) == expected[mode], mode
+    assert 1.0 <= stats["inflight_peak"] <= stats["inflight_cap"] <= engine.max_batch_size, stats
+    assert stats["inflight_peak"] <= len(batch)
+    # requests in flight = running + offloaded, so the mean running batch cannot exceed the peak
+    assert stats["batch_size_mean"] <= stats["inflight_peak"] + 1e-9
+    assert 0.0 <= stats["host_util_peak"] <= 1.0
+    if stats["num_offloads"] == 0:
+        assert stats["host_util_peak"] == 0.0, "host pages in use although nothing was offloaded"
+    else:
+        assert stats["host_util_peak"] > 0.0
+    assert 0.0 < stats["kv_util_peak"] <= 1.0
+    _assert_pool_clean(engine, "after the admission workload")
+
+
+# ----------------------------------------------------------------------------
+# return_logprobs=False (also in the offload-stress process)
+# ----------------------------------------------------------------------------
+def test_return_logprobs_false(engine, prompts, eos):
+    batch = prompts["short"][:3] + prompts["long"][:1]
+    max_new_tokens = 40
+    with_lp = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=0.0, eos_token_ids=eos)
+    without = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=0.0, eos_token_ids=eos, return_logprobs=False)
+    assert with_lp.logprobs is not None and not common.check_responses(with_lp, max_new_tokens, eos, greedy=True)
+    assert without.logprobs is None
+    assert [list(t) for t in without.token_ids] == [list(t) for t in with_lp.token_ids], (
+        "greedy tokens differ between return_logprobs=True and False"
+    )
+    assert without.finish_reasons == with_lp.finish_reasons
+    assert set(without.stats) == set(STAT_KEYS) and without.stats["num_tokens"] == with_lp.stats["num_tokens"]
+
+    # sampling without log-probs: the response contract still holds
+    sampled = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=1.0, eos_token_ids=eos, return_logprobs=False)
+    assert sampled.logprobs is None and len(sampled.token_ids) == len(sampled.finish_reasons) == len(batch)
+    eos_set = set(eos)
+    for i, (tokens, reason) in enumerate(zip(sampled.token_ids, sampled.finish_reasons)):
+        assert 1 <= len(tokens) <= max_new_tokens, (i, len(tokens))
+        assert not any(t in eos_set for t in tokens[:-1]), f"response {i}: tokens after an EOS"
+        if tokens[-1] in eos_set:
+            assert reason == "stop"
+        else:
+            assert len(tokens) == max_new_tokens and reason == "length", (i, len(tokens), reason)
+    _assert_pool_clean(engine, "after return_logprobs=False")
+    _assert_torch_defaults_untouched()
+
+
+# ----------------------------------------------------------------------------
+# offload stress (SPARSESPEC_TEST_OFFLOAD_STRESS=1 only: small GPU KV pool)
+# ----------------------------------------------------------------------------
+def _per_response_mean_dlogp(a, b) -> list[float]:
+    out = []
+    for row_a, row_b in zip(a, b):
+        deltas = [abs(x - y) for x, y in zip(row_a, row_b) if math.isfinite(x) and math.isfinite(y)]
+        out.append(sum(deltas) / len(deltas) if deltas else math.inf)
+    return out
+
+
+def test_offload_stress(engine, hf_model, prompts, eos):
+    """More fixed-length requests than the GPU KV pool holds: the scheduler must offload KV to the
+    host pool and restore it, and that must not corrupt anything.
+
+    Every request runs to exactly max_new_tokens: the EOS list is one id >= vocab_size, which can
+    never be sampled (the engine does not range-check eos_token_ids: serve.rl.base.normalize_eos_ids
+    only makes them ints and RLSpecScheduler only tests membership). The trainer forward still pads
+    with the model's real EOS id.
+
+    1. no-offload reference: the same prompts, greedy, a few at a time (fewer than can fill the pool);
+    2. all at once, T=1: offloads happen; every log-prob agrees with the HF trainer forward as tightly
+       as in the non-offloaded test (and no single response is off);
+    3. all at once, greedy: offloads happen; outputs equal the reference (or differ only at a bf16
+       near-tie of HF's logits: batch composition changes the bf16 arithmetic);
+    4. the first reference chunk again: bitwise identical (nothing stale after offloading);
+    the KV pools are clean after every call."""
+    pool = engine.kv_pool
+    kv = pool.capacity
+    max_new_tokens = STRESS_MAX_NEW_TOKENS
+    never = [int(engine.config.vocab_size)]
+    batch = [prompts["stress"][i % len(prompts["stress"])] for i in range(STRESS_NUM_REQUESTS)]
+    longest, shortest = max(map(len, batch)), min(map(len, batch))
+    need_max = memory.request_token_need(longest, max_new_tokens, engine.spec_stride)
+    need_min = memory.request_token_need(shortest, max_new_tokens, engine.spec_stride)
+    cap = engine.inflight_cap(longest, max_new_tokens)
+    admit_tokens = memory.admission_capacity_tokens(engine.plan, engine.max_batch_size, engine.spec_stride, engine.chunk_size)
+    # worst_case commits each request's own need; host_guard uses the cap for the longest prompt
+    max_in_flight = cap if engine.admission == "host_guard" else min(engine.max_batch_size, admit_tokens // need_min)
+    # fewer requests than can fill the GPU pool at all: the reference never offloads
+    chunk = memory.gpu_full_min_active(kv, need_max, longest) - 1
+    print(
+        f"\n[stress] admission={engine.admission} kv_capacity={kv} host_capacity={pool._MAX_CPU_CAPACITY} "
+        f"requests={len(batch)} prompt lengths {shortest}-{longest} max_new_tokens={max_new_tokens} "
+        f"need/request {need_min}-{need_max} inflight_cap={cap} (at most {max_in_flight} in flight) "
+        f"reference chunk={chunk}"
+    )
+    if need_max > kv:
+        pytest.fail(f"one request needs {need_max} KV tokens > the {kv}-token pool: raise SPARSESPEC_TEST_KV_CAPACITY_TOKENS")
+    if min(cap, len(batch)) * need_min <= kv:
+        pytest.fail(
+            f"this workload cannot overflow the GPU pool: {min(cap, len(batch))} requests in flight x {need_min} "
+            f"tokens <= {kv}. Lower SPARSESPEC_TEST_KV_CAPACITY_TOKENS or raise SPARSESPEC_TEST_STRESS_MAX_NEW_TOKENS"
+        )
+    if chunk < 1:
+        pytest.fail(f"no request count below the pool size: {kv} tokens, {need_max} per request")
+
+    def check_fixed_length(result, label, greedy):
+        problems = common.check_responses(result, max_new_tokens, never, greedy=greedy)
+        assert not problems, f"{label}: {problems[:5]}"
+        lengths = sorted({len(t) for t in result.token_ids})
+        assert lengths == [max_new_tokens], f"{label}: response lengths {lengths}, all must be {max_new_tokens}"
+        assert set(result.finish_reasons) == {"length"}, f"{label}: {set(result.finish_reasons)}"
+
+    # 1. no-offload reference, a few requests at a time
+    reference: list[list[int]] = []
+    first_chunk = None
+    for start in range(0, len(batch), chunk):
+        part = batch[start : start + chunk]
+        result = engine.generate(part, max_new_tokens=max_new_tokens, temperature=0.0, eos_token_ids=never)
+        check_fixed_length(result, f"reference chunk at {start}", greedy=True)
+        assert result.stats["num_offloads"] == 0, (
+            f"reference chunk at {start} ({len(part)} requests) offloaded {result.stats['num_offloads']:.0f} times: "
+            "serve.rl.memory.gpu_full_min_active says it cannot fill the pool"
+        )
+        _assert_pool_clean(engine, f"after reference chunk at {start}")
+        reference += [list(t) for t in result.token_ids]
+        if first_chunk is None:
+            first_chunk = (part, [list(t) for t in result.token_ids])
+
+    # 2. everything at once at T=1: offloads, and the log-probs still match the trainer forward
+    sampled = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=1.0, eos_token_ids=never)
+    stats = sampled.stats
+    print(f"[stress] T=1 stats: {stats}")
+    check_fixed_length(sampled, "T=1 stress", greedy=False)
+    _assert_pool_clean(engine, "after the T=1 stress run")
+    assert stats["num_offloads"] > 0, f"no KV offload happened (kv_util_peak {stats['kv_util_peak']:.3f}): the test did not test anything"
+    assert 0.0 < stats["host_util_peak"] <= 1.0, stats["host_util_peak"]
+    assert 0.0 < stats["kv_util_peak"] <= 1.0
+    assert 1.0 <= stats["inflight_peak"] <= max_in_flight, (stats["inflight_peak"], max_in_flight)
+    assert stats["inflight_cap"] == float(cap)
+    if engine.admission == "host_guard":
+        assert stats["inflight_peak"] <= stats["inflight_cap"]
+
+    trainer = common.hf_trainer_logprobs(hf_model, batch, sampled.token_ids, temperature=1.0, pad_token_id=eos[-1])
+    lp = common.compare_logprobs(sampled.logprobs, trainer)
+    per_response = _per_response_mean_dlogp(sampled.logprobs, trainer)
+    worst = sorted(range(len(per_response)), key=lambda i: -per_response[i])[:5]
+    print(f"[stress] log-probs vs HF trainer forward: {lp}")
+    print(f"[stress] worst responses (index, mean |delta log p|): {[(i, round(per_response[i], 4)) for i in worst]}")
+    assert lp["num_nonfinite"] == 0 and lp["count"] == len(batch) * max_new_tokens
+    assert lp["mean"] <= MAX_MEAN_DLOGP, (
+        f"with offloading, mean |delta log p| = {lp['mean']:.4f} > {MAX_MEAN_DLOGP} (SPARSESPEC_TEST_MAX_MEAN_DLOGP); "
+        f"median {lp['median']:.4f}, p99 {lp['p99']:.4f}, max {lp['max']:.4f}: offload / restore corrupts KV?"
+    )
+    assert max(per_response) <= STRESS_MAX_RESPONSE_DLOGP, (
+        f"response {worst[0]}: mean |delta log p| {per_response[worst[0]]:.4f} > {STRESS_MAX_RESPONSE_DLOGP} "
+        "(SPARSESPEC_TEST_STRESS_MAX_RESPONSE_DLOGP): one request's KV was corrupted by offload / restore?"
+    )
+
+    # 3. everything at once, greedy: offloads, and the same tokens as without offloading
+    greedy = engine.generate(batch, max_new_tokens=max_new_tokens, temperature=0.0, eos_token_ids=never)
+    print(f"[stress] T=0 stats: {greedy.stats}")
+    check_fixed_length(greedy, "greedy stress", greedy=True)
+    _assert_pool_clean(engine, "after the greedy stress run")
+    assert greedy.stats["num_offloads"] > 0, "the greedy stress run did not offload"
+    tokens = [list(t) for t in greedy.token_ids]
+    records = []
+    for i, (prompt, got, want) in enumerate(zip(batch, tokens, reference)):
+        if got == want:
+            continue
+        record = analyse_prompt(hf_model, prompt, got, want, TIE_MARGIN)
+        records.append((i, record["status"], record["first_diff"], record["margin"]))
+    print(f"[stress] greedy with offloading vs without: {len(batch) - len(records)}/{len(batch)} identical; divergences: {records}")
+    bad = [r for r in records if r[1].isupper()]
+    assert not bad, (
+        "greedy output with offloading diverges from the no-offload output against a clear HF margin "
+        f"(> {TIE_MARGIN} logits): (request, status, first diff, margin) = {bad}"
+    )
+
+    # 4. nothing stale: the first reference chunk again, bitwise
+    part, want = first_chunk
+    again = engine.generate(part, max_new_tokens=max_new_tokens, temperature=0.0, eos_token_ids=never)
+    assert again.stats["num_offloads"] == 0
+    assert [list(t) for t in again.token_ids] == want, "after the offload runs the same small greedy batch changed"
+    _assert_pool_clean(engine, "at the end of the stress test")
+    _assert_torch_defaults_untouched()

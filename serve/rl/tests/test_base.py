@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import os
 import subprocess
 import sys
@@ -91,6 +92,29 @@ def test_finalize_without_eos_and_exact_length():
 def test_finalize_mismatched_lengths_raise(num_logprobs):
     with pytest.raises(RuntimeError, match="3 response tokens"):
         finalize_response([20, 21, 22], _lps(num_logprobs), max_new_tokens=8, eos_ids=EOS)
+
+
+@pytest.mark.parametrize(
+    "tokens, max_new, expected, reason",
+    [
+        ([20, 7, 21, 22], 8, [20, 7], FINISH_STOP),  # EOS kept, the rest dropped
+        ([20, 21, 22, 23, 24], 3, [20, 21, 22], FINISH_LENGTH),  # cut to max_new_tokens
+        ([7], 1, [7], FINISH_STOP),
+        ([20, 21, 3], 3, [20, 21, 3], FINISH_STOP),  # EOS exactly at the last allowed position
+    ],
+)
+def test_finalize_without_logprobs(tokens, max_new, expected, reason):
+    """return_logprobs=False: the engines pass None, which stays None (not [] and not trimmed)."""
+    toks, lps, why = finalize_response(tokens, None, max_new_tokens=max_new, eos_ids=EOS)
+    assert (toks, lps, why) == (expected, None, reason)
+    # the same tokens and reason as with log-probs
+    with_lps = finalize_response(tokens, _lps(len(tokens)), max_new_tokens=max_new, eos_ids=EOS)
+    assert with_lps[0] == toks and with_lps[2] == why and len(with_lps[1]) == len(toks)
+
+
+def test_finalize_without_logprobs_has_no_length_check():
+    # nothing to compare against: only the token rule applies
+    assert finalize_response([20, 21, 22], None, max_new_tokens=2, eos_ids=EOS) == ([20, 21], None, FINISH_LENGTH)
 
 
 def test_finalize_mismatch_is_checked_before_trimming():
@@ -225,6 +249,9 @@ def test_stat_keys_and_empty_stats():
         "batch_size_mean",
         "num_offloads",
         "kv_util_peak",
+        "host_util_peak",
+        "inflight_cap",
+        "inflight_peak",
         "peak_mem_gb",
         "gen_s",
     ):
@@ -241,6 +268,7 @@ def test_generation_result_defaults():
     b = GenerationResult(token_ids=[[1]], logprobs=[[0.0]], finish_reasons=["length"])
     assert tuple(a.stats) == STAT_KEYS
     assert a.stats is not b.stats
+    assert GenerationResult(token_ids=[[1]], logprobs=None, finish_reasons=["length"]).logprobs is None
 
 
 def test_load_report_fields():
@@ -254,11 +282,26 @@ def test_rollout_engine_is_abstract_with_the_documented_interface():
         {"generate", "load_weights", "sleep", "wake_up", "is_sleeping"}
     )
 
+    signature = inspect.signature(RolloutEngine.generate)
+    keyword_only = {n: p.default for n, p in signature.parameters.items() if p.kind is p.KEYWORD_ONLY}
+    assert keyword_only == {"eos_token_ids": None, "return_logprobs": True}
+    assert [n for n, p in signature.parameters.items() if p.kind is not p.KEYWORD_ONLY] == [
+        "self", "prompt_token_ids", "max_new_tokens", "temperature", "top_p", "top_k",
+    ]  # fmt: skip
+
     class Minimal(RolloutEngine):
         def generate(
-            self, prompt_token_ids, max_new_tokens, temperature=1.0, top_p=1.0, top_k=-1, *, eos_token_ids=None
+            self,
+            prompt_token_ids,
+            max_new_tokens,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=-1,
+            *,
+            eos_token_ids=None,
+            return_logprobs=True,
         ):
-            return GenerationResult([], [], [])
+            return GenerationResult([], [] if return_logprobs else None, [])
 
         def load_weights(self, named_tensors):
             return LoadReport(0, 0, 0, 0.0)

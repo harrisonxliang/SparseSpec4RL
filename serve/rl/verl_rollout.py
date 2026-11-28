@@ -26,6 +26,7 @@ contract lets the SparseSpec arm change)::
       kv_cache: pillar
       max_batch_size: 64
       cuda_graph: true
+      admission: worst_case           # or "host_guard" (see serve/rl/scheduler.py)
       # optional: seed, chunk_size, cpu_offload_ratio, kv_capacity_tokens,
       #           transient_reserve_gb
 """
@@ -59,6 +60,9 @@ _PUBLISHED_STATS = (
     "batch_size_mean",
     "num_offloads",
     "kv_util_peak",
+    "host_util_peak",
+    "inflight_cap",
+    "inflight_peak",
     "peak_mem_gb",
     "process_peak_alloc_gb",
     "process_peak_reserved_gb",
@@ -81,7 +85,8 @@ class SparseSpecRolloutConfig:
     chunk_size: int = 256
     cpu_offload_ratio: float = 1.5
     kv_capacity_tokens: int | None = None
-    transient_reserve_gb: float = 2.0
+    transient_reserve_gb: float | None = None  # None -> worst case for max_batch_size, at least 2 GiB
+    admission: str = "worst_case"
 
     @classmethod
     def from_rollout_config(cls, rollout_config) -> "SparseSpecRolloutConfig":
@@ -104,7 +109,13 @@ class SparseSpecRolloutConfig:
         cfg.seed = int(cfg.seed)
         cfg.chunk_size = int(cfg.chunk_size)
         cfg.cpu_offload_ratio = float(cfg.cpu_offload_ratio)
-        cfg.transient_reserve_gb = float(cfg.transient_reserve_gb)
+        if cfg.transient_reserve_gb is not None:
+            cfg.transient_reserve_gb = float(cfg.transient_reserve_gb)
+        cfg.admission = str(cfg.admission)
+        if cfg.admission not in ("worst_case", "host_guard"):
+            raise ValueError(
+                f"rollout.sparsespec.admission must be 'worst_case' or 'host_guard', got {cfg.admission!r}"
+            )
         if cfg.kv_capacity_tokens is not None:
             cfg.kv_capacity_tokens = int(cfg.kv_capacity_tokens)
         return cfg
@@ -138,6 +149,9 @@ def build_engine(model_path: str, rollout_config, ss: SparseSpecRolloutConfig) -
         cpu_offload_ratio=ss.cpu_offload_ratio,
         kv_capacity_tokens=ss.kv_capacity_tokens,
         transient_reserve_gb=ss.transient_reserve_gb,
+        admission=ss.admission,
+        expected_max_prompt_len=int(rollout_config.prompt_length),
+        expected_max_new_tokens=int(rollout_config.response_length),
     )
 
 
@@ -250,6 +264,9 @@ class SparseSpecRollout(BaseRollout):
             prompt_token_ids,
             max_new_tokens=self.config.response_length,
             eos_token_ids=eos_token_id,
+            # only collected when they are returned to the trainer, so that
+            # calculate_log_probs=False measures the engine without them
+            return_logprobs=bool(self.config.calculate_log_probs),
             **self._sampling_kwargs(prompts),
         )
         self.last_stats = dict(result.stats)

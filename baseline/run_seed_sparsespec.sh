@@ -8,6 +8,7 @@
 #   bash baseline/run_seed_sparsespec.sh                         # the real run: seed 0, 100 steps
 #   STEPS=3 EXP_NAME=sparsespec_smoke bash baseline/run_seed_sparsespec.sh
 #   SPARSESPEC_CUDA_GRAPH=False STEPS=3 EXP_NAME=sparsespec_eager_smoke bash baseline/run_seed_sparsespec.sh
+#   SPARSESPEC_ADMISSION=host_guard STEPS=3 EXP_NAME=sparsespec_host_guard_smoke bash baseline/run_seed_sparsespec.sh
 #   DRY_RUN=1 bash baseline/run_seed_sparsespec.sh               # print the hydra overrides and exit
 #   bash integration/smoke_reference.sh                          # reference-engine plumbing smoke (reduced size)
 #
@@ -38,6 +39,16 @@ SPARSESPEC_ENGINE=${SPARSESPEC_ENGINE:-sparsespec}
 # timing; True is the engine's intended mode. See STATUS.md (fairness).
 SPARSESPEC_CUDA_GRAPH=${SPARSESPEC_CUDA_GRAPH:-True}
 
+# Admission policy of the engine's scheduler (serve/rl/scheduler.py):
+#   worst_case = admit only what fits if every in-flight sequence runs to 8192 tokens;
+#   host_guard = admit on current free capacity like upstream, capped so the
+#                host offload pool can never run out.
+SPARSESPEC_ADMISSION=${SPARSESPEC_ADMISSION:-worst_case}
+
+# Return the engine's target log-probs to the trainer (diagnostics only; False
+# also stops the engine from collecting them, to measure their cost).
+SPARSESPEC_CALC_LOGPROBS=${SPARSESPEC_CALC_LOGPROBS:-True}
+
 SPARSESPEC_ARGS=(
     # ---- rollout engine block: the only sanctioned diff vs baseline ----
     # Later overrides win in hydra, so these replace rollout.name=vllm from
@@ -56,10 +67,11 @@ SPARSESPEC_ARGS=(
     +actor_rollout_ref.rollout.sparsespec.kv_cache=pillar
     +actor_rollout_ref.rollout.sparsespec.max_batch_size=64
     +actor_rollout_ref.rollout.sparsespec.cuda_graph="$SPARSESPEC_CUDA_GRAPH"
+    +actor_rollout_ref.rollout.sparsespec.admission="$SPARSESPEC_ADMISSION"
     # Diagnostics only: also return the engine's target log-probs so verl logs
     # training/rollout_probs_diff_* (engine vs actor) every step. The actor
     # still recomputes old_log_probs itself; the loss does not use these.
-    actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.calculate_log_probs="$SPARSESPEC_CALC_LOGPROBS"
     # Weight reload needs no flag: the sharding manager copies the FSDP
     # actor's weights into the engine before every rollout.
 )
@@ -120,7 +132,7 @@ mkdir -p "$LOG_DIR" "$RESULTS_DIR" "$CKPT_ROOT/$EXP_NAME"
 LOG_FILE="$LOG_DIR/$EXP_NAME.log"
 
 START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-echo "[run_sparsespec] $EXP_NAME: seed=$SEED steps=$STEPS config=$CONFIG_VERSION engine=$SPARSESPEC_ENGINE cuda_graph=$SPARSESPEC_CUDA_GRAPH"
+echo "[run_sparsespec] $EXP_NAME: seed=$SEED steps=$STEPS config=$CONFIG_VERSION engine=$SPARSESPEC_ENGINE cuda_graph=$SPARSESPEC_CUDA_GRAPH admission=$SPARSESPEC_ADMISSION calculate_log_probs=$SPARSESPEC_CALC_LOGPROBS"
 echo "[run_sparsespec] logging to $LOG_FILE"
 
 set +e

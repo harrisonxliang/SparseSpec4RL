@@ -21,7 +21,8 @@ ROLLOUT = "actor_rollout_ref.rollout."
 EXPERIMENT_KEYS = {"trainer.experiment_name", "trainer.default_local_dir"}  # differ by EXP_NAME only
 RUN_ENV_VARS = ("SEED", "STEPS", "EXP_NAME", "SPARSESPEC_ENGINE", "MODEL_PATH", "DATA_DIR", "CKPT_ROOT",
                 "DRY_RUN", "REPO_ROOT", "PYTHONPATH", "ARGV_FILE", "CALLS_FILE", "PYTHONPATH_FILE",
-                "SPARSESPEC_CUDA_GRAPH", "ALLOW_FULL_SIZE_REFERENCE")  # fmt: skip
+                "SPARSESPEC_CUDA_GRAPH", "SPARSESPEC_ADMISSION", "SPARSESPEC_CALC_LOGPROBS",
+                "ALLOW_FULL_SIZE_REFERENCE")  # fmt: skip
 
 EXPECTED_ROLLOUT_CHANGES = {
     ROLLOUT + "name": "sparsespec",
@@ -33,6 +34,7 @@ EXPECTED_ROLLOUT_CHANGES = {
     ROLLOUT + "sparsespec.kv_cache": "pillar",
     ROLLOUT + "sparsespec.max_batch_size": "64",
     ROLLOUT + "sparsespec.cuda_graph": "True",
+    ROLLOUT + "sparsespec.admission": "worst_case",
     ROLLOUT + "calculate_log_probs": "True",
 }
 
@@ -368,17 +370,18 @@ def test_overrides_compose_with_verls_config(tk, dry_run):
         "kv_cache": "pillar",
         "max_batch_size": 64,
         "cuda_graph": True,
+        "admission": "worst_case",
     }
     assert {k: type(v) for k, v in block.items()} == {
         "engine": str, "spec_stride": int, "budget_ratio": float, "num_min_budget": int,
-        "kv_cache": str, "max_batch_size": int, "cuda_graph": bool,
+        "kv_cache": str, "max_batch_size": int, "cuda_graph": bool, "admission": str,
     }  # fmt: skip
 
     parsed = SparseSpecRolloutConfig.from_rollout_config(rollout)  # a struct-mode DictConfig, as in the worker
     assert parsed == SparseSpecRolloutConfig(
         engine="sparsespec", spec_stride=8, budget_ratio=0.05, num_min_budget=128, kv_cache="pillar",
         max_batch_size=64, cuda_graph=True, seed=0, chunk_size=256, cpu_offload_ratio=1.5,
-        kv_capacity_tokens=None, transient_reserve_gb=2.0,
+        kv_capacity_tokens=None, transient_reserve_gb=None, admission="worst_case",
     )  # fmt: skip
 
     # what the rollout class reads, with the values the script intends
@@ -481,10 +484,14 @@ def test_composed_config_fits_the_memory_plan_on_the_a100(dry_run):
         max_batch_size=ss.max_batch_size,
         cuda_graph=ss.cuda_graph,
         cpu_offload_ratio=ss.cpu_offload_ratio,
-        transient_reserve_bytes=int(ss.transient_reserve_gb * 1024**3),
+        # as SparseSpecEngine.__init__ passes them: None = the automatic worst-case reserve
+        transient_reserve_bytes=None if ss.transient_reserve_gb is None else int(ss.transient_reserve_gb * 1024**3),
         kv_capacity_tokens=ss.kv_capacity_tokens,
+        spec_stride=ss.spec_stride,
+        chunk_size=ss.chunk_size,
     )
     assert plan.planned_bytes <= plan.budget_bytes == int(42.5e9 * 0.45)
+    assert plan.transient_bytes == 2 * 1024**3  # the automatic reserve keeps 2 GiB at max_batch_size 64
     check_workload_fits(
         prompt_lens=[int(rollout.prompt_length)],
         max_new_tokens=int(rollout.response_length),
@@ -494,3 +501,76 @@ def test_composed_config_fits_the_memory_plan_on_the_a100(dry_run):
         plan=plan,
         max_position_embeddings=40960,
     )
+
+
+    # the in-flight caps the engine will log at start-up (expected_max_prompt_len / expected_max_new_tokens)
+    from serve.rl.memory import inflight_cap
+
+    caps = {
+        mode: inflight_cap(
+            mode, plan, ss.max_batch_size, ss.spec_stride, ss.chunk_size,
+            int(rollout.prompt_length), int(rollout.response_length),
+        )
+        for mode in ("worst_case", "host_guard")
+    }  # fmt: skip
+    assert 26 <= caps["worst_case"] <= 29 and 45 <= caps["host_guard"] <= 49, caps
+
+
+# ---------------------------------------------------------------------------
+# SPARSESPEC_ADMISSION / SPARSESPEC_CALC_LOGPROBS
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "env, key, default, value",
+    [
+        ({"SPARSESPEC_ADMISSION": "host_guard"}, "+" + ROLLOUT + "sparsespec.admission=", "worst_case", "host_guard"),
+        ({"SPARSESPEC_CALC_LOGPROBS": "False"}, ROLLOUT + "calculate_log_probs=", "True", "False"),
+    ],
+)
+def test_admission_and_logprob_switches_change_exactly_their_override(dry_run, env, key, default, value):
+    on, switched = dry_run(), dry_run(**env)
+    assert [a for a in on if a.startswith(key)] == [key + default]
+    assert [a for a in switched if a.startswith(key)] == [key + value]
+    # nothing else moves, and the order of the list is kept
+    assert [a for a in on if not a.startswith(key)] == [a for a in switched if not a.startswith(key)]
+    assert on.index(key + default) == switched.index(key + value)
+
+
+def test_switched_overrides_compose_with_verls_config(dry_run):
+    from omegaconf import OmegaConf
+
+    from serve.rl.verl_rollout import SparseSpecRolloutConfig
+
+    default = compose(dry_run())
+    both = compose(dry_run(SPARSESPEC_ADMISSION="host_guard", SPARSESPEC_CALC_LOGPROBS="False"))
+    rollout = both.actor_rollout_ref.rollout
+    assert rollout.sparsespec.admission == "host_guard" and type(rollout.sparsespec.admission) is str
+    assert rollout.calculate_log_probs is False  # hydra turns "False" into a real bool
+    assert default.actor_rollout_ref.rollout.calculate_log_probs is True
+    parsed = SparseSpecRolloutConfig.from_rollout_config(rollout)
+    assert parsed.admission == "host_guard"
+    assert parsed == SparseSpecRolloutConfig.from_rollout_config(
+        OmegaConf.merge(default.actor_rollout_ref.rollout, {"sparsespec": {"admission": "host_guard"}})
+    )
+    # the two composed configs differ in exactly these two keys
+    flat_default = flatten(OmegaConf.to_container(default, resolve=True))
+    flat_both = flatten(OmegaConf.to_container(both, resolve=True))
+    changed = {k for k in flat_default.keys() | flat_both.keys() if flat_default.get(k) != flat_both.get(k)}
+    assert changed == {ROLLOUT + "sparsespec.admission", ROLLOUT + "calculate_log_probs"}
+
+
+@pytest.mark.parametrize("value", ["hostguard", "worst-case", "HOST_GUARD", "none"])
+def test_invalid_admission_value_is_rejected_by_the_rollout_config(dry_run, value):
+    """The script passes SPARSESPEC_ADMISSION through unchecked; the worker's config
+    parsing (SparseSpecRolloutConfig) is what refuses it, before any engine is built."""
+    from serve.rl.verl_rollout import SparseSpecRolloutConfig
+
+    overrides = dry_run(SPARSESPEC_ADMISSION=value)
+    assert "+" + ROLLOUT + "sparsespec.admission=" + value in overrides
+    rollout = compose(overrides).actor_rollout_ref.rollout
+    with pytest.raises(ValueError, match="admission"):
+        SparseSpecRolloutConfig.from_rollout_config(rollout)
+
+
+def test_empty_switches_fall_back_to_the_defaults(dry_run):
+    """``${VAR:-default}``: an exported but empty variable means the default, not an empty override."""
+    assert dry_run(SPARSESPEC_ADMISSION="", SPARSESPEC_CALC_LOGPROBS="") == dry_run()

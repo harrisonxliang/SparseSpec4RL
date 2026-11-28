@@ -43,6 +43,13 @@ STAT_KEYS = (
     "batch_size_mean",  # mean number of requests per forward pass
     "num_offloads",  # KV offload events (GPU -> host)
     "kv_util_peak",  # peak fraction of the GPU KV pool in use
+    "host_util_peak",  # peak fraction of the host offload pool in use
+    # In-flight requests the admission policy guarantees room for, sized for
+    # the call's longest prompt. A hard limit under host_guard; worst_case
+    # budgets tokens per request, so shorter prompts can push inflight_peak
+    # slightly above it.
+    "inflight_cap",
+    "inflight_peak",  # most requests in flight at once (running + offloaded)
     "peak_mem_gb",  # peak GPU memory attributed to the engine during generate
     # Running process-wide peaks of torch's allocator up to the end of this
     # generate(). generate() resets torch's peak counters to measure
@@ -63,13 +70,14 @@ def empty_stats() -> dict[str, float]:
 class GenerationResult:
     """Output of ``RolloutEngine.generate`` (plain Python containers only).
 
-    ``token_ids[i]`` and ``logprobs[i]`` have the same length. Plain lists are
+    ``token_ids[i]`` and ``logprobs[i]`` have the same length; ``logprobs`` is
+    None when the caller passed ``return_logprobs=False``. Plain lists are
     returned rather than tensors so nothing created under
     ``torch.inference_mode`` leaks into the trainer's autograd graph.
     """
 
     token_ids: list[list[int]]
-    logprobs: list[list[float]]
+    logprobs: list[list[float]] | None
     finish_reasons: list[str]
     stats: dict[str, float] = field(default_factory=empty_stats)
 
@@ -135,22 +143,25 @@ def first_eos_index(tokens: Sequence[int], eos_ids, start: int = 0) -> int:
 
 def finalize_response(
     tokens: Sequence[int],
-    logprobs: Sequence[float],
+    logprobs: Sequence[float] | None,
     max_new_tokens: int,
     eos_ids,
-) -> tuple[list[int], list[float], str]:
+) -> tuple[list[int], list[float] | None, str]:
     """Apply the response contract: stop at the first EOS (kept), else cut to
-    ``max_new_tokens``. Token ids and log-probs are trimmed together."""
-    if len(tokens) != len(logprobs):
+    ``max_new_tokens``. Token ids and log-probs are trimmed together;
+    ``logprobs=None`` (not collected) stays None."""
+    if logprobs is not None and len(tokens) != len(logprobs):
         raise RuntimeError(
             f"engine bookkeeping error: {len(tokens)} response tokens but "
             f"{len(logprobs)} target log-probs"
         )
     tokens = list(tokens[:max_new_tokens])
-    logprobs = list(logprobs[:max_new_tokens])
+    if logprobs is not None:
+        logprobs = list(logprobs[:max_new_tokens])
     eos_pos = first_eos_index(tokens, eos_ids)
     if eos_pos >= 0:
-        return tokens[: eos_pos + 1], logprobs[: eos_pos + 1], FINISH_STOP
+        tokens = tokens[: eos_pos + 1]
+        return tokens, (None if logprobs is None else logprobs[: eos_pos + 1]), FINISH_STOP
     return tokens, logprobs, FINISH_LENGTH
 
 
@@ -170,9 +181,12 @@ class RolloutEngine(abc.ABC):
         top_k: int = -1,
         *,
         eos_token_ids=None,
+        return_logprobs: bool = True,
     ) -> GenerationResult:
         """Sample one response per prompt. ``temperature == 0`` means greedy
-        (reported log-probs are then 0.0: the greedy target is one-hot)."""
+        (reported log-probs are then 0.0: the greedy target is one-hot).
+        With ``return_logprobs=False`` the log-probs are not collected at all
+        and ``GenerationResult.logprobs`` is None."""
 
     @abc.abstractmethod
     def load_weights(self, named_tensors: NamedTensors) -> LoadReport:

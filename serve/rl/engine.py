@@ -54,13 +54,16 @@ from serve.rl.base import (
     validate_sampling_params,
 )
 from serve.rl.memory import (
+    ADMISSION_MODES,
     GIB,
     EngineLimits,
     MemoryPlan,
     admission_capacity_tokens,
     check_prob_offsets,
     check_workload_fits,
+    host_guard_inflight_cap,
     host_pool_tokens,
+    inflight_cap,
     pinned_block_bytes,
     plan_memory,
     request_token_need,
@@ -140,10 +143,13 @@ class SparseSpecEngine(RolloutEngine):
         batch_policy: str = "greedy",
         cpu_offload_ratio: float = 1.5,
         kv_capacity_tokens: int | None = None,
-        transient_reserve_gb: float = 2.0,
+        transient_reserve_gb: float | None = None,
         safety_reserve_gb: float = 0.5,
         eos_token_ids=None,
         verify_init_weights: bool = True,
+        admission: str = "worst_case",
+        expected_max_prompt_len: int | None = None,
+        expected_max_new_tokens: int | None = None,
     ):
         """Build the engine like ``run_inference`` does. Differences:
 
@@ -161,7 +167,13 @@ class SparseSpecEngine(RolloutEngine):
         * Tied ``lm_head`` / ``embed_tokens`` share one storage again
           (``from_pretrained`` + ``.to(device)`` leaves two equal copies).
         * Scheduling is synchronous (``async_cpu=False``), admission is
-          ``offloading`` with the guards in ``RLSpecScheduler``.
+          ``offloading`` with the guards in ``RLSpecScheduler``:
+          ``admission="worst_case"`` (default) or ``"host_guard"``.
+        * ``transient_reserve_gb=None`` reserves the worst-case sampler /
+          verification scratch for ``max_batch_size`` (at least 2 GiB).
+        * ``expected_max_prompt_len`` / ``expected_max_new_tokens`` (the
+          rollout's prompt_length / response_length) let the workload checks
+          run at construction instead of at the first long prompt.
         """
         if not logging.getLogger().hasHandlers():
             global_logging_config()
@@ -177,6 +189,8 @@ class SparseSpecEngine(RolloutEngine):
             raise ValueError(f"batch_policy must be 'greedy' or 'naive', got {batch_policy!r}")
         if spec_stride < 1:
             raise ValueError(f"spec_stride must be >= 1, got {spec_stride}")
+        if admission not in ADMISSION_MODES:
+            raise ValueError(f"admission must be one of {ADMISSION_MODES}, got {admission!r}")
         if not torch.cuda.is_available():
             raise RuntimeError("SparseSpecEngine needs a CUDA device")
         if PillarCachePtr._INITIALIZED != 0:
@@ -196,6 +210,7 @@ class SparseSpecEngine(RolloutEngine):
         self.seed = int(seed)
         self.chunk_size = int(chunk_size)
         self.batch_policy = batch_policy
+        self.admission = admission
         self.device = torch.device(device)
         self.dtype = str_to_dtype(dtype)
         self._closed = False
@@ -274,11 +289,28 @@ class SparseSpecEngine(RolloutEngine):
                 cuda_graph=self.cuda_graph,
                 limits=self.limits,
                 cpu_offload_ratio=cpu_offload_ratio,
-                transient_reserve_bytes=int(transient_reserve_gb * GIB),
+                transient_reserve_bytes=None if transient_reserve_gb is None else int(transient_reserve_gb * GIB),
                 safety_bytes=int(safety_reserve_gb * GIB),
                 kv_capacity_tokens=kv_capacity_tokens,
+                spec_stride=self.spec_stride,
+                chunk_size=self.chunk_size,
             )
             logger.info("SparseSpecEngine memory plan:\n%s", self.plan.describe())
+            if expected_max_prompt_len is not None and expected_max_new_tokens is not None:
+                # fail at start-up, not at the first long prompt hours into a run
+                self._check_workload([int(expected_max_prompt_len)], int(expected_max_new_tokens))
+                logger.info(
+                    "admission=%s: %d requests in flight when every prompt has %d tokens and may generate %d "
+                    "(worst_case: %d, admits a few more when prompts are shorter; host_guard: %d; "
+                    "max_batch_size %d)",
+                    self.admission,
+                    self.inflight_cap(int(expected_max_prompt_len), int(expected_max_new_tokens)),
+                    int(expected_max_prompt_len),
+                    int(expected_max_new_tokens),
+                    self.inflight_cap(int(expected_max_prompt_len), int(expected_max_new_tokens), "worst_case"),
+                    self.inflight_cap(int(expected_max_prompt_len), int(expected_max_new_tokens), "host_guard"),
+                    self.max_batch_size,
+                )
 
             self._spec_args = {
                 "spec_stride": self.spec_stride,
@@ -589,6 +621,7 @@ class SparseSpecEngine(RolloutEngine):
         top_k: int = -1,
         *,
         eos_token_ids=None,
+        return_logprobs: bool = True,
     ) -> GenerationResult:
         self._require_open()
         if self._sleeping:
@@ -607,24 +640,10 @@ class SparseSpecEngine(RolloutEngine):
             if min(p) < 0 or max(p) >= vocab:
                 raise ValueError(f"prompt {i} contains a token id outside [0, {vocab})")
         prompt_lens = [len(p) for p in prompts]
-        check_workload_fits(
-            prompt_lens=prompt_lens,
-            max_new_tokens=max_new_tokens,
-            spec_stride=self.spec_stride,
-            chunk_size=self.chunk_size,
-            max_batch_size=self.max_batch_size,
-            plan=self.plan,
-            max_position_embeddings=getattr(self.config, "max_position_embeddings", None),
-            limits=self.limits,
-        )
+        self._check_workload(prompt_lens, max_new_tokens)
         admit_cap = admission_capacity_tokens(self.plan, self.max_batch_size, self.spec_stride, self.chunk_size)
-        self._warn_inflight_cap(admit_cap, max(prompt_lens), max_new_tokens, len(prompts))
-        longest_ctx = max(prompt_lens) + max_new_tokens + self.spec_stride + 2
-        if max(self.num_min_budget, math.ceil(longest_ctx * self.budget_ratio)) >= self.limits.max_len_selected_kv_cache:
-            raise ValueError(
-                f"budget_ratio={self.budget_ratio} x context {longest_ctx} exceeds the selected-KV buffer "
-                f"({self.limits.max_len_selected_kv_cache} entries)"
-            )
+        call_cap = self.inflight_cap(max(prompt_lens), max_new_tokens)
+        self._warn_inflight_cap(admit_cap, call_cap, max(prompt_lens), max_new_tokens, len(prompts))
 
         start = time.perf_counter()
         requests: list[Request] = []
@@ -648,6 +667,9 @@ class SparseSpecEngine(RolloutEngine):
                     self.kv_pool,
                     self._runner,
                     total_token_capacity=admit_cap,
+                    admission=self.admission,
+                    inflight_cap=call_cap,
+                    collect_logprobs=return_logprobs,
                     **self._job_args(temperature, eos, len(prompts)),
                 )
                 finished = scheduler.run(list(requests))
@@ -663,7 +685,9 @@ class SparseSpecEngine(RolloutEngine):
             token_ids, logprobs, reasons = [], [], []
             for request in requests:
                 response = list(request.token_ids[request.len_input :])
-                toks, lps, reason = finalize_response(response, request.rl_logprobs, max_new_tokens, eos_set)
+                toks, lps, reason = finalize_response(
+                    response, request.rl_logprobs if return_logprobs else None, max_new_tokens, eos_set
+                )
                 if not toks:
                     raise RuntimeError(f"request {request.request_id} produced an empty response")
                 if reason == FINISH_LENGTH and len(toks) != max_new_tokens:
@@ -689,6 +713,11 @@ class SparseSpecEngine(RolloutEngine):
                 batch_size_mean=(rl.sum_active / rl.num_iters) if rl.num_iters else 0.0,
                 num_offloads=float(rl.num_offloads),
                 kv_util_peak=rl.peak_kv_used / self.kv_pool.capacity,
+                host_util_peak=(
+                    rl.peak_host_used / self.kv_pool._MAX_CPU_CAPACITY if self.kv_pool._MAX_CPU_CAPACITY else 0.0
+                ),
+                inflight_cap=float(call_cap),
+                inflight_peak=float(rl.peak_inflight),
                 # peak of everything allocated during generate, minus what the
                 # rest of the process (the trainer) already held at the start,
                 # plus what the CUDA graphs' private pools reserve unallocated
@@ -704,7 +733,12 @@ class SparseSpecEngine(RolloutEngine):
                     self.plan.budget_bytes / GIB,
                 )
             self._measured["last_peak_gb"] = stats["peak_mem_gb"]
-            return GenerationResult(token_ids=token_ids, logprobs=logprobs, finish_reasons=reasons, stats=stats)
+            return GenerationResult(
+                token_ids=token_ids,
+                logprobs=logprobs if return_logprobs else None,
+                finish_reasons=reasons,
+                stats=stats,
+            )
         finally:
             # Drop every request / cache pointer so all KV pages return to the
             # pool (also after an exception), then make sure they did.
@@ -720,44 +754,88 @@ class SparseSpecEngine(RolloutEngine):
     # ------------------------------------------------------------------
     # misc
     # ------------------------------------------------------------------
-    def inflight_cap(self, longest_prompt: int, max_new_tokens: int) -> int:
-        """Most requests the admission guard lets run at once for this workload."""
-        admit_cap = admission_capacity_tokens(self.plan, self.max_batch_size, self.spec_stride, self.chunk_size)
-        need = request_token_need(longest_prompt, max_new_tokens, self.spec_stride)
-        return min(self.max_batch_size, admit_cap // need)
+    def _check_workload(self, prompt_lens: list[int], max_new_tokens: int) -> None:
+        """Refuse workloads the kernels' fixed buffers or the KV pools cannot hold."""
+        check_workload_fits(
+            prompt_lens=prompt_lens,
+            max_new_tokens=max_new_tokens,
+            spec_stride=self.spec_stride,
+            chunk_size=self.chunk_size,
+            max_batch_size=self.max_batch_size,
+            plan=self.plan,
+            max_position_embeddings=getattr(self.config, "max_position_embeddings", None),
+            limits=self.limits,
+        )
+        longest_ctx = max(prompt_lens) + max_new_tokens + self.spec_stride + 2
+        if max(self.num_min_budget, math.ceil(longest_ctx * self.budget_ratio)) >= self.limits.max_len_selected_kv_cache:
+            raise ValueError(
+                f"budget_ratio={self.budget_ratio} x context {longest_ctx} exceeds the selected-KV buffer "
+                f"({self.limits.max_len_selected_kv_cache} entries)"
+            )
 
-    def _warn_inflight_cap(self, admit_cap: int, longest_prompt: int, max_new_tokens: int, num_prompts: int) -> None:
-        need = request_token_need(longest_prompt, max_new_tokens, self.spec_stride)
-        cap = admit_cap // need
-        key = (max_new_tokens, cap)
+    def inflight_cap(self, longest_prompt: int, max_new_tokens: int, admission: str | None = None) -> int:
+        """Most requests the admission policy lets be in flight at once for this workload."""
+        return inflight_cap(
+            admission or self.admission,
+            self.plan,
+            self.max_batch_size,
+            self.spec_stride,
+            self.chunk_size,
+            longest_prompt,
+            max_new_tokens,
+        )
+
+    def _warn_inflight_cap(
+        self, admit_cap: int, cap: int, longest_prompt: int, max_new_tokens: int, num_prompts: int
+    ) -> None:
+        key = (self.admission, max_new_tokens, cap)
         if cap >= min(self.max_batch_size, num_prompts) or key in self._warned_inflight_cap:
             return
         self._warned_inflight_cap.add(key)
         plan = self.plan
         kv, token_bytes = plan.kv_capacity_tokens, plan.kv_token_bytes
-        reserve = plan.total_capacity_tokens - admit_cap
-        host_needed = self.max_batch_size * need + reserve - kv
-        # plan_memory sizes the host pool with host_pool_tokens: a request below 15/16 of its power-of-two
-        # pinned block is shrunk to the block below, so advise a ratio whose request survives that sizing
-        block = pinned_block_bytes(host_needed * token_bytes)
-        request = max(host_needed, -(-(block - block // 16) // token_bytes))
-        ratio = -(-10 * request // kv) / 10  # rounded up to one decimal
-        while host_pool_tokens(int(kv * ratio), token_bytes) < host_needed:
-            ratio = round(ratio + 0.1, 1)
-        pinned = pinned_block_bytes(host_pool_tokens(int(kv * ratio), token_bytes) * token_bytes)
+        need = request_token_need(longest_prompt, max_new_tokens, self.spec_stride)
+
+        def cap_with_host_pool(host_tokens: int) -> int:
+            reserve = plan.total_capacity_tokens - admit_cap
+            worst_case = (kv + host_tokens - reserve) // need
+            if self.admission == "host_guard":  # same rule as serve.rl.memory.inflight_cap
+                return max(host_guard_inflight_cap(kv, host_tokens, need, longest_prompt), worst_case)
+            return worst_case
+
+        # plan_memory sizes the host pool to power-of-two pinned blocks (host_pool_tokens), so advise the
+        # smallest ratio (one decimal) whose pool, after that sizing, really lifts the cap
+        ratio, lifted = None, False
+        for tenths in range(0, 2001):
+            candidate = tenths / 10
+            if cap_with_host_pool(host_pool_tokens(int(kv * candidate), token_bytes)) >= self.max_batch_size:
+                ratio, lifted = candidate, True
+                break
+        other = "host_guard" if self.admission == "worst_case" else "worst_case"
+        if lifted:
+            pinned = pinned_block_bytes(host_pool_tokens(int(kv * ratio), token_bytes) * token_bytes)
+            advice = (
+                f"sparsespec.cpu_offload_ratio >= {ratio:.1f} (locks {pinned / GIB:.0f} GiB of pinned host RAM; "
+                "the host pool is sized to power-of-two blocks, so a smaller ratio falls back to the block below) "
+                "would lift the cap to max_batch_size"
+            )
+        else:
+            advice = "no host pool size lifts the cap to max_batch_size"
         logger.warning(
-            "worst-case KV admission limits concurrency to %d in-flight requests although max_batch_size is %d: "
-            "each request may need %d KV tokens and the pools hold %d (GPU) + %d (host). Realised concurrency is "
-            "logged as sparsespec/batch_size_mean. sparsespec.cpu_offload_ratio >= %.1f (locks %.0f GiB of pinned "
-            "host RAM; the host pool is sized to power-of-two blocks, so a smaller ratio falls back to the block "
-            "below) would lift the cap to max_batch_size.",
+            "admission=%s limits concurrency to about %d in-flight requests (sized for this call's longest "
+            "prompt; worst_case budgets tokens, so shorter prompts admit a few more) although max_batch_size is "
+            "%d: each request may need %d KV tokens and the pools hold %d (GPU) + %d (host). Realised "
+            "concurrency is logged as sparsespec/batch_size_mean and sparsespec/inflight_peak. %s; "
+            "admission=%s would allow %d with the current pools.",
+            self.admission,
             cap,
             self.max_batch_size,
             need,
             kv,
             plan.cpu_capacity_tokens,
-            ratio,
-            pinned / GIB,
+            advice,
+            other,
+            self.inflight_cap(longest_prompt, max_new_tokens, other),
         )
 
     def memory_report(self) -> dict:

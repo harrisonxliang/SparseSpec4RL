@@ -163,7 +163,9 @@ def test_cpu_importable_names_used_by_the_engine_exist():
         (base, ["GenerationResult", "LoadReport", "NamedTensors", "RolloutEngine", "empty_stats",
                 "finalize_response", "normalize_eos_ids", "validate_prompts", "validate_sampling_params",
                 "FINISH_LENGTH", "FINISH_STOP", "first_eos_index"]),
-        (memory, ["GIB", "EngineLimits", "MemoryPlan", "check_workload_fits", "plan_memory", "request_token_need"]),
+        (memory, ["ADMISSION_MODES", "GIB", "EngineLimits", "MemoryPlan", "admission_capacity_tokens",
+                  "check_prob_offsets", "check_workload_fits", "host_guard_inflight_cap", "host_pool_tokens",
+                  "inflight_cap", "pinned_block_bytes", "plan_memory", "request_token_need"]),
         (weights, ["load_weights_inplace", "parameter_pointers", "unique_parameter_bytes", "verify_weights"]),
     ):  # fmt: skip
         for name in names:
@@ -194,10 +196,20 @@ def test_rl_scheduler_overrides_keep_the_upstream_signatures(src):
         # every override still runs the upstream implementation
         assert _calls(ours, f"super().{name}") or name == "is_request_complete", name
 
-    # __init__(kv_pool, model, *, total_token_capacity, **job_args) on top of upstream's (kv_pool, model, **kwargs)
+    # __init__(kv_pool, model, *, total_token_capacity, admission="worst_case", inflight_cap=None,
+    # collect_logprobs=True, **job_args) on top of upstream's (kv_pool, model, **kwargs)
     init = _functions(rl)["__init__"]
     assert [a.arg for a in init.args.args] == ["self", "kv_pool", "model"]
-    assert [a.arg for a in init.args.kwonlyargs] == ["total_token_capacity"] and init.args.kwarg is not None
+    assert [a.arg for a in init.args.kwonlyargs] == [
+        "total_token_capacity",
+        "admission",
+        "inflight_cap",
+        "collect_logprobs",
+    ]
+    assert init.args.kwarg is not None
+    defaults = [None if d is None else ast.literal_eval(d) for d in init.args.kw_defaults]
+    assert defaults == [None, "worst_case", None, True]  # total_token_capacity is required
+    assert init.args.kw_defaults[0] is None
     assert [a.arg for a in upstream["__init__"].args.args] == ["self", "kv_pool", "model"]
     assert upstream["__init__"].args.kwarg is not None
     # the driver loop the engine calls
@@ -231,11 +243,26 @@ def test_engine_supplies_every_job_argument_the_schedulers_read(src):
     assert literal["admit_policy"] == "offloading"
     assert literal["async_cpu"] is False
     assert literal["tp_ranks"] == 1
-    # the scheduler is given the job arguments and the admission budget
+    # the scheduler is given the job arguments, the admission budget, the admission mode, the per-call
+    # in-flight cap and whether to collect log-probs (generate's return_logprobs)
     call = _calls(methods["generate"], "RLSpecScheduler")
     assert len(call) == 1 and len(call[0].args) == 2
-    assert _keywords(call[0]) == {"total_token_capacity"}
+    assert _keywords(call[0]) == {"total_token_capacity", "admission", "inflight_cap", "collect_logprobs"}
+    passed = {kw.arg: ast.unparse(kw.value) for kw in call[0].keywords if kw.arg is not None}
+    assert passed == {
+        "total_token_capacity": "admit_cap",
+        "admission": "self.admission",
+        "inflight_cap": "call_cap",
+        "collect_logprobs": "return_logprobs",
+    }
     assert any(kw.arg is None and "_job_args" in ast.unparse(kw.value) for kw in call[0].keywords)
+    # ... and those names hold what they say: the worst-case budget and the cap of the configured mode
+    generate_src = ast.unparse(methods["generate"])
+    budget = "admit_cap = admission_capacity_tokens(self.plan, self.max_batch_size, self.spec_stride, self.chunk_size)"
+    assert budget in generate_src
+    assert "call_cap = self.inflight_cap(max(prompt_lens), max_new_tokens)" in generate_src
+    cap_method = ast.unparse(methods["inflight_cap"])
+    assert "admission or self.admission" in cap_method and "return inflight_cap(" in cap_method
 
 
 def test_cache_class_initialisation_gets_what_it_reads(src):
@@ -309,6 +336,22 @@ def test_engine_calls_only_pass_keywords_the_callees_accept(src):
     assert _keywords(limits) == set(memory.EngineLimits.__dataclass_fields__)  # every limit read from the real classes
     for call in _calls(engine, "admission_capacity_tokens"):
         inspect.signature(memory.admission_capacity_tokens).bind(*call.args, **{k: None for k in _keywords(call)})
+    # the admission-mode helpers (a module-level function shadowed by the method of the same name)
+    for dotted, fn in (
+        ("inflight_cap", memory.inflight_cap),
+        ("host_guard_inflight_cap", memory.host_guard_inflight_cap),
+    ):
+        calls = _calls(engine, dotted)
+        assert len(calls) == 1, f"{dotted}: {len(calls)} calls"
+        inspect.signature(fn).bind(*calls[0].args, **{k: None for k in _keywords(calls[0])})
+    method = _functions(engine)["inflight_cap"]
+    assert _params(method) == ["longest_prompt", "max_new_tokens", "admission"]
+    assert _calls(engine, "self.inflight_cap")
+    for call in _calls(engine, "self.inflight_cap"):
+        assert 2 <= len(call.args) <= 3 and not _keywords(call), ast.unparse(call)
+    # plan_memory gets the scheduler geometry it sizes the automatic transient reserve with
+    (plan_call,) = _calls(engine, "plan_memory")
+    assert {"spec_stride", "chunk_size", "transient_reserve_bytes"} <= _keywords(plan_call)
     for call in _calls(engine, "finalize_response"):
         assert len(call.args) == len(inspect.signature(base.finalize_response).parameters)
     for dotted, fn in (

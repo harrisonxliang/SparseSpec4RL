@@ -104,9 +104,18 @@ def vllm_generate_sequences_tail(
 
 
 def expected_vllm_output(config, prompts_snapshot, eos_token_id, raw_result, non_tensor_batch):
-    """What vLLMRollout would have returned had vLLM produced ``raw_result``."""
+    """What vLLMRollout would have returned had vLLM produced ``raw_result``.
+
+    vLLMRollout only fills ``rollout_log_probs`` when ``calculate_log_probs`` is
+    set (it stays ``[]`` otherwise); the engine returns ``logprobs=None`` then.
+    """
     self = SimpleNamespace(config=config, pad_token_id=3)
     idx = prompts_snapshot["input_ids"]
+    if raw_result.logprobs is None:
+        assert not config.calculate_log_probs, "the engine returned no log-probs although they were asked for"
+        rollout_log_probs = []
+    else:
+        rollout_log_probs = [list(r) for r in raw_result.logprobs]
     return vllm_generate_sequences_tail(
         self,
         idx,
@@ -116,7 +125,7 @@ def expected_vllm_output(config, prompts_snapshot, eos_token_id, raw_result, non
         idx.size(0),
         non_tensor_batch,
         [list(r) for r in raw_result.token_ids],
-        [list(r) for r in raw_result.logprobs],
+        rollout_log_probs,
     )
 
 
@@ -168,7 +177,17 @@ class ScriptedEngine(RolloutEngine):
         self.calls = []
         self._sleeping = False
 
-    def generate(self, prompt_token_ids, max_new_tokens, temperature=1.0, top_p=1.0, top_k=-1, *, eos_token_ids=None):
+    def generate(
+        self,
+        prompt_token_ids,
+        max_new_tokens,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+        *,
+        eos_token_ids=None,
+        return_logprobs=True,
+    ):
         if self._sleeping:
             raise RuntimeError("asleep")
         self.calls.append(
@@ -179,6 +198,7 @@ class ScriptedEngine(RolloutEngine):
                 top_p=top_p,
                 top_k=top_k,
                 eos_token_ids=eos_token_ids,
+                return_logprobs=return_logprobs,
             )
         )
         stats = empty_stats()
@@ -186,7 +206,7 @@ class ScriptedEngine(RolloutEngine):
         stats.update(num_requests=len(self.responses), gen_s=0.5, num_cycles=7, accept_len_mean=np.float32(4.5))
         return GenerationResult(
             token_ids=[list(r) for r in self.responses],
-            logprobs=[list(r) for r in self.logprobs],
+            logprobs=[list(r) for r in self.logprobs] if return_logprobs else None,
             finish_reasons=["stop"] * len(self.responses),
             stats=stats,
         )
@@ -369,6 +389,9 @@ def test_output_equals_vllm_rollout_tail(tk, tiny_model, with_raw_prompt_ids, ca
         assert call.kwargs["temperature"] == temperature and type(call.kwargs["temperature"]) is float
         assert call.kwargs["top_p"] == 1.0 and type(call.kwargs["top_p"]) is float
         assert call.kwargs["top_k"] == -1 and type(call.kwargs["top_k"]) is int
+        # log-probs are collected only when they are returned to the trainer
+        assert call.kwargs["return_logprobs"] is calculate_log_probs
+        assert (raw.logprobs is None) is (not calculate_log_probs)
 
         # --- parity with vLLMRollout's own post-processing --------------------
         expected = expected_vllm_output(rollout.config, inputs, tk.EOS_IDS, raw, {"index": index_before})
@@ -390,7 +413,8 @@ def test_output_equals_vllm_rollout_tail(tk, tiny_model, with_raw_prompt_ids, ca
 
         assert torch.equal(b["prompts"], inputs["input_ids"])  # prompts untouched
         assert torch.equal(b["input_ids"], torch.cat([b["prompts"], b["responses"]], dim=-1))
-        for row, (tokens, logprobs) in enumerate(zip(raw.token_ids, raw.logprobs)):
+        raw_logprobs = raw.logprobs if calculate_log_probs else [None] * len(raw.token_ids)
+        for row, (tokens, logprobs) in enumerate(zip(raw.token_ids, raw_logprobs)):
             k = len(tokens)
             assert b["responses"][row, :k].tolist() == tokens
             assert b["responses"][row, k:].tolist() == [tk.PAD_ID] * (RESPONSE_LENGTH - k)  # RIGHT padded
@@ -712,7 +736,8 @@ def test_config_defaults(tk):
             chunk_size=256,
             cpu_offload_ratio=1.5,
             kv_capacity_tokens=None,
-            transient_reserve_gb=2.0,
+            transient_reserve_gb=None,  # auto: the worst case for max_batch_size, at least 2 GiB
+            admission="worst_case",
         )
         assert type(cfg.seed) is int
 
@@ -730,16 +755,18 @@ def test_config_values_and_types(tk):
             "sparsespec.cpu_offload_ratio": 2,
             "sparsespec.kv_capacity_tokens": 50000,
             "sparsespec.transient_reserve_gb": 3,
+            "sparsespec.admission": "host_guard",
         }
     )
     cfg = SparseSpecRolloutConfig.from_rollout_config(rollout_config)
     assert (cfg.engine, cfg.spec_stride, cfg.budget_ratio, cfg.num_min_budget) == ("reference", 4, 0.1, 64)
     assert (cfg.max_batch_size, cfg.cuda_graph, cfg.chunk_size) == (32, False, 128)
     assert (cfg.cpu_offload_ratio, cfg.kv_capacity_tokens, cfg.transient_reserve_gb) == (2.0, 50000, 3.0)
+    assert cfg.admission == "host_guard"
     for name, kind in {
         "spec_stride": int, "budget_ratio": float, "num_min_budget": int, "max_batch_size": int,
         "cuda_graph": bool, "seed": int, "chunk_size": int, "cpu_offload_ratio": float,
-        "kv_capacity_tokens": int, "transient_reserve_gb": float,
+        "kv_capacity_tokens": int, "transient_reserve_gb": float, "admission": str,
     }.items():  # fmt: skip
         assert type(getattr(cfg, name)) is kind, name
 
@@ -1243,7 +1270,14 @@ def test_sparsespec_engine_implements_the_interface_the_glue_uses(tk):
     assert [a.arg for a in generate.args.args] == [
         n for n, p in expected.parameters.items() if p.kind is not inspect.Parameter.KEYWORD_ONLY
     ]
-    assert [a.arg for a in generate.args.kwonlyargs] == ["eos_token_ids"]
+    assert [a.arg for a in generate.args.kwonlyargs] == ["eos_token_ids", "return_logprobs"]
+    assert [a.arg for a in generate.args.kwonlyargs] == [
+        n for n, p in expected.parameters.items() if p.kind is inspect.Parameter.KEYWORD_ONLY
+    ]
+    defaults = [None if d is None else ast.literal_eval(d) for d in generate.args.kw_defaults]
+    assert defaults == [None, True] == [
+        p.default for p in expected.parameters.values() if p.kind is inspect.Parameter.KEYWORD_ONLY
+    ]
 
     # generate() fills every statistic the sharding manager publishes, under the shared names
     updates = [
@@ -1258,3 +1292,152 @@ def test_sparsespec_engine_implements_the_interface_the_glue_uses(tk):
     assert filled <= set(STAT_KEYS), filled - set(STAT_KEYS)
     assert set(verl_rollout_module._PUBLISHED_STATS) <= filled
     assert set(verl_rollout_module._PUBLISHED_STATS) <= set(STAT_KEYS)
+
+
+# ---------------------------------------------------------------------------
+# calculate_log_probs -> return_logprobs, admission settings, new statistics
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("calculate_log_probs", [True, False])
+def test_calculate_log_probs_decides_whether_the_engine_collects_them(tk, tiny_model, calculate_log_probs):
+    responses = [[50, 51, tk.IM_END_ID], [52] * RESPONSE_LENGTH]
+    engine = ScriptedEngine(responses)
+    rollout = make_rollout(tk, tiny_model, engine=engine, calculate_log_probs=calculate_log_probs)
+    _, gen_batch = tk.build_gen_batch(tk.make_prompts([4, 6]), PROMPT_LENGTH)
+    output = rollout.generate_sequences(with_worker_meta(tk, gen_batch))
+    assert engine.calls[-1].return_logprobs is calculate_log_probs
+    assert ("rollout_log_probs" in output.batch.keys()) is calculate_log_probs
+    if calculate_log_probs:
+        expected = [lp + [-1.0] * (RESPONSE_LENGTH - len(lp)) for lp in engine.logprobs]
+        assert output.batch["rollout_log_probs"].tolist() == expected
+    # the rest of the output does not depend on it
+    assert output.batch["responses"].tolist() == [r + [tk.PAD_ID] * (RESPONSE_LENGTH - len(r)) for r in responses]
+
+
+def test_calculate_log_probs_false_with_the_reference_engine(tk, tiny_model):
+    """Same seed with and without log-probs: identical rollouts, only rollout_log_probs is missing."""
+    outputs = {}
+    for flag in (True, False):
+        rollout = make_rollout(tk, tiny_model, engine_kwargs={"seed": 3}, calculate_log_probs=flag)
+        recorder = tk.GenerateRecorder(rollout.engine)
+        _, gen_batch = tk.build_gen_batch(tk.make_prompts(PROMPT_LENGTHS, seed=2), PROMPT_LENGTH, n=2)
+        outputs[flag] = rollout.generate_sequences(with_worker_meta(tk, gen_batch))
+        assert recorder.last.kwargs["return_logprobs"] is flag
+        assert (recorder.last.result.logprobs is None) is (not flag)
+    assert set(outputs[True].batch.keys()) - set(outputs[False].batch.keys()) == {"rollout_log_probs"}
+    for key in outputs[False].batch.keys():
+        assert torch.equal(outputs[True].batch[key], outputs[False].batch[key]), key
+
+
+def test_new_engine_stats_are_published(tk, tiny_model):
+    for name in ("host_util_peak", "inflight_cap", "inflight_peak"):
+        assert name in STAT_KEYS and name in verl_rollout_module._PUBLISHED_STATS
+        assert "sparsespec/" + name in tk.SPARSESPEC_TIMING_KEYS
+
+    class AdmissionStatsEngine(ScriptedEngine):
+        def generate(self, *args, **kwargs):
+            result = super().generate(*args, **kwargs)
+            result.stats.update(host_util_peak=np.float64(0.4375), inflight_cap=45, inflight_peak=np.int64(44))
+            return result
+
+    engine = AdmissionStatsEngine([[tk.IM_END_ID]] * 2)
+    rollout = make_rollout(tk, tiny_model, engine=engine, awake=False)
+    manager = SparseSpecShardingManager(module=tiny_model, rollout=rollout, rollout_config=rollout.config)
+    _, gen_batch = tk.build_gen_batch(tk.make_prompts([4, 6]), PROMPT_LENGTH)
+    with manager:
+        rollout.generate_sequences(with_worker_meta(tk, gen_batch))
+    timing = manager.timing
+    assert (timing["sparsespec/host_util_peak"], timing["sparsespec/inflight_cap"]) == (0.4375, 45.0)
+    assert timing["sparsespec/inflight_peak"] == 44.0
+    assert all(type(timing["sparsespec/" + n]) is float for n in ("host_util_peak", "inflight_cap", "inflight_peak"))
+    assert set(timing) == {"reshard"} | set(tk.SPARSESPEC_TIMING_KEYS)
+
+
+def test_config_admission_parsing(tk):
+    parse = SparseSpecRolloutConfig.from_rollout_config
+    assert parse(tk.make_rollout_config()).admission == "worst_case"  # the default
+    assert parse({"sparsespec": {}}).admission == "worst_case"
+    for mode in ("worst_case", "host_guard"):
+        cfg = parse(tk.make_rollout_config(**{"sparsespec.admission": mode}))
+        assert cfg.admission == mode and type(cfg.admission) is str
+    for bad in ("hostguard", "worst-case", "Host_Guard", "", "none", 1):
+        with pytest.raises(ValueError, match="admission"):
+            parse(tk.make_rollout_config(**{"sparsespec.admission": bad}))
+
+
+def test_config_transient_reserve_default_is_automatic(tk):
+    parse = SparseSpecRolloutConfig.from_rollout_config
+    assert parse(tk.make_rollout_config()).transient_reserve_gb is None
+    cfg = parse(tk.make_rollout_config(**{"sparsespec.transient_reserve_gb": 2}))
+    assert cfg.transient_reserve_gb == 2.0 and type(cfg.transient_reserve_gb) is float
+
+
+def test_build_engine_passes_the_admission_settings_to_sparsespec_engine(tk, tiny_model, monkeypatch):
+    """engine=sparsespec through build_sparsespec_rollout, with a recording stand-in injected as
+    serve.rl.engine (the real module needs CUDA + flashinfer and is not imported here)."""
+    import sys
+    import types
+
+    created = []
+
+    class RecordingSparseSpecEngine(ScriptedEngine):
+        def __init__(self, **kwargs):
+            super().__init__([])
+            created.append(kwargs)
+
+    fake = types.ModuleType("serve.rl.engine")
+    fake.SparseSpecEngine = RecordingSparseSpecEngine
+    monkeypatch.setitem(sys.modules, "serve.rl.engine", fake)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    config = tk.make_rollout_config(
+        prompt_length=PROMPT_LENGTH,
+        response_length=RESPONSE_LENGTH,
+        seed=11,
+        **{"sparsespec.engine": "sparsespec", "sparsespec.admission": "host_guard"},
+    )
+    rollout, _ = build_sparsespec_rollout(
+        model_path="/ckpt/qwen3", rollout_config=config, tokenizer=tk.TinyTokenizer(),
+        model_hf_config=tiny_model.config, actor_module=tiny_model, offload_param=False,
+    )  # fmt: skip
+    assert isinstance(rollout.engine, RecordingSparseSpecEngine)
+    assert created == [
+        {
+            "model_path": "/ckpt/qwen3",
+            "mem_fraction": 0.45,
+            "max_batch_size": 64,
+            "spec_stride": 8,
+            "budget_ratio": 0.05,
+            "num_min_budget": 128,
+            "kv_cache": "pillar",
+            "cuda_graph": True,
+            "seed": 11,
+            "dtype": "bfloat16",
+            "device": "cpu",
+            "chunk_size": 256,
+            "cpu_offload_ratio": 1.5,
+            "kv_capacity_tokens": None,
+            "transient_reserve_gb": None,
+            "admission": "host_guard",
+            "expected_max_prompt_len": PROMPT_LENGTH,
+            "expected_max_new_tokens": RESPONSE_LENGTH,
+        }
+    ]
+    kwargs = created[0]
+    assert type(kwargs["expected_max_prompt_len"]) is int and type(kwargs["expected_max_new_tokens"]) is int
+
+    # ... and the real SparseSpecEngine.__init__ takes these keywords, with these defaults
+    init = _method(_engine_class(tk), "__init__")
+    names = [a.arg for a in init.args.args[1:] + init.args.kwonlyargs]
+    assert set(kwargs) <= set(names)
+    defaults = dict(zip([a.arg for a in init.args.kwonlyargs], init.args.kw_defaults))
+    positional_defaults = dict(
+        zip([a.arg for a in init.args.args][-len(init.args.defaults) :], init.args.defaults)
+    )
+    defaults.update(positional_defaults)
+    pinned = {
+        "admission": "worst_case",
+        "expected_max_prompt_len": None,
+        "expected_max_new_tokens": None,
+        "transient_reserve_gb": None,
+    }
+    assert {name: ast.literal_eval(defaults[name]) for name in pinned} == pinned

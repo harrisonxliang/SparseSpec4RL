@@ -164,6 +164,31 @@ def graph_bytes(vocab_size: int, hidden_size: int, dtype_bytes: int, kv_capacity
     return int(2 * tokens * per_token * 1.2)
 
 
+MIN_TRANSIENT_BYTES = 2 * GIB
+
+
+def transient_bytes_worst_case(
+    max_batch_size: int, spec_stride: int, chunk_size: int, vocab_size: int, dtype_bytes: int
+) -> int:
+    """Largest sampler / verification scratch one scheduler iteration can need.
+
+    Worst case: every in-flight request verifies in the same pass
+    (``spec_stride + 1`` rows each) next to one prefill chunk. Per row of
+    ``vocab_size`` entries, peak A (during sampling) holds the logits, the
+    exponential noise, the new float32 probabilities and the previous pass's
+    probabilities (still referenced by the scheduler loop); peak B (during
+    verification) holds both passes' probabilities, the gathered draft and
+    target probabilities for every draft token and one noise row per request.
+    Rows are at least 640 because a CUDA-graph pass is padded to its captured
+    batch size.
+    """
+    rows = max(max_rows_per_pass(max_batch_size, spec_stride, chunk_size), GRAPH_BATCH_SIZES[-1])
+    draft_rows = max_batch_size * spec_stride
+    peak_sampling = rows * vocab_size * (dtype_bytes + 4 + 4 + 4)
+    peak_verify = vocab_size * (rows * 8 + draft_rows * 8 + max_batch_size * 4)
+    return max(peak_sampling, peak_verify)
+
+
 def pinned_block_bytes(nbytes: int) -> int:
     """Bytes torch's pinned (page-locked) host allocator takes for a request.
 
@@ -205,9 +230,11 @@ def plan_memory(
     cuda_graph: bool,
     limits: EngineLimits | None = None,
     cpu_offload_ratio: float = 1.5,
-    transient_reserve_bytes: int = 2 * GIB,
+    transient_reserve_bytes: int | None = None,
     safety_bytes: int = GIB // 2,
     kv_capacity_tokens: int | None = None,
+    spec_stride: int = 8,
+    chunk_size: int = 256,
 ) -> MemoryPlan:
     if not 0.0 < mem_fraction <= 1.0:
         raise ValueError(f"mem_fraction must be in (0, 1], got {mem_fraction}")
@@ -226,6 +253,12 @@ def plan_memory(
     req_total = req_each * max_batch_size
     graphs = graph_bytes(vocab_size, hidden_size, dtype_bytes) if cuda_graph else 0
     notes: list[str] = []
+    if transient_reserve_bytes is None:
+        # auto: the worst case for this batch size, never below 2 GiB
+        transient_reserve_bytes = max(
+            MIN_TRANSIENT_BYTES,
+            int(1.1 * transient_bytes_worst_case(max_batch_size, spec_stride, chunk_size, vocab_size, dtype_bytes)),
+        )
 
     non_kv = weights_bytes + fixed + graphs + req_total + transient_reserve_bytes + safety_bytes
     auto_kv_bytes = budget - non_kv
@@ -296,6 +329,101 @@ def admission_capacity_tokens(plan: "MemoryPlan", max_batch_size: int, spec_stri
     """
     reserve = max_batch_size * (spec_stride + 2) + chunk_size + 2 * OFFLOAD_CHUNK_TOKENS
     return plan.kv_capacity_tokens + plan.cpu_capacity_tokens - reserve
+
+
+ADMISSION_MODES = ("worst_case", "host_guard")
+
+
+def gpu_full_min_active(kv_capacity_tokens: int, need: int, longest_prompt: int) -> int:
+    """Fewest active requests that can fill the GPU pool, i.e. trigger an offload.
+
+    Upstream offloads when ``free - owed < 0`` with ``free = kv - sum(len)``
+    over the active requests (a partially offloaded request is drained before
+    a new victim is picked) and ``owed <= k + longest_prompt`` (one token per
+    drafting / verifying request, the rest of one prompt being prefilled).
+    Every active request holds fewer than ``need`` tokens, so an offload with
+    ``k`` active requests implies ``k * need > kv - longest_prompt``.
+    """
+    return max(1, (kv_capacity_tokens - longest_prompt) // need + 1)
+
+
+def host_guard_host_bound(num_in_flight: int, kv_capacity_tokens: int, need: int, longest_prompt: int) -> int:
+    """Upper bound on host offload pages ever in use with ``num_in_flight`` requests.
+
+    Follows from three facts about upstream's ``offloading`` policy
+    (serve/scheduler/scheduler.py, ``admit_requests``):
+
+    1. The offload victim is the SHORTEST active request. With ``k`` active
+       requests sharing a pool of ``kv`` tokens it holds at most ``kv // k``.
+    2. Offloaded requests form a stack: only the most recently offloaded one
+       is restored, and nothing is admitted while the stack is non-empty. So
+       every request offloaded after victim ``j`` was active when ``j`` was
+       picked: if ``m`` requests are on the stack, the ``j``-th from the top
+       was picked among at least ``k_full + j - 1`` active requests, where
+       ``k_full`` is the fewest that can fill the pool at all.
+    3. An offloaded request does not run, so its footprint is frozen at its
+       length when picked.
+
+    Hence host pages <= sum over k = k_full .. num_in_flight of kv // k:
+    the pool fills by harmonic increments, not by ``need`` per request.
+    """
+    k_full = gpu_full_min_active(kv_capacity_tokens, need, longest_prompt)
+    return sum(min(kv_capacity_tokens // k, need) for k in range(k_full, num_in_flight + 1))
+
+
+def host_guard_inflight_cap(
+    kv_capacity_tokens: int,
+    cpu_capacity_tokens: int,
+    need: int,
+    longest_prompt: int,
+    margin: int = 1024,  # one offload step (Request.MAX_OFFLOADING_LEN)
+) -> int:
+    """Most requests ``host_guard`` admission lets be in flight at once: the
+    largest ``n`` whose host bound (plus one offload step of margin) fits the
+    host pool. Without a host pool this is the number of worst-case requests
+    the GPU pool holds outright."""
+    k_full = gpu_full_min_active(kv_capacity_tokens, need, longest_prompt)
+    n = k_full - 1  # below k_full the GPU pool cannot fill: nothing is ever offloaded
+    used = 0
+    while True:
+        step = min(kv_capacity_tokens // (n + 1), need)
+        if step <= 0 or used + step + margin > cpu_capacity_tokens:
+            break
+        used += step
+        n += 1
+        if n >= 1 << 20:  # the pool is effectively unbounded for any real batch size
+            break
+    return max(1, n)
+
+
+def inflight_cap(
+    admission: str,
+    plan: "MemoryPlan",
+    max_batch_size: int,
+    spec_stride: int,
+    chunk_size: int,
+    longest_prompt: int,
+    max_new_tokens: int,
+) -> int:
+    """Requests in flight the policy guarantees room for when every prompt has
+    ``longest_prompt`` tokens (<= max_batch_size). host_guard enforces it as a
+    hard cap; worst_case budgets tokens, not requests, so a call with shorter
+    prompts can have a few more in flight."""
+    need = request_token_need(longest_prompt, max_new_tokens, spec_stride)
+    worst_case = admission_capacity_tokens(plan, max_batch_size, spec_stride, chunk_size) // need
+    if admission == "worst_case":
+        cap = worst_case
+    elif admission == "host_guard":
+        # Never below worst_case's count: that many requests fit the pools even
+        # if every one runs to its limit, whatever the admission rule, and on
+        # small host pools the harmonic bound's margins can come out one lower.
+        cap = max(
+            host_guard_inflight_cap(plan.kv_capacity_tokens, plan.cpu_capacity_tokens, need, longest_prompt),
+            worst_case,
+        )
+    else:
+        raise ValueError(f"admission must be one of {ADMISSION_MODES}, got {admission!r}")
+    return max(1, min(max_batch_size, cap))
 
 
 def max_rows_per_pass(max_batch_size: int, spec_stride: int, chunk_size: int) -> int:
